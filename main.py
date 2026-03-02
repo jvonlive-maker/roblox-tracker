@@ -9,29 +9,29 @@ UNIVERSE_ID = "3150475059"
 GAME_NAME = "FF2"
 NTFY_TOPIC = "CCU_TICKER8312010" 
 CHECK_INTERVAL = 900 
-VOLATILITY_THRESHOLD = 20.0
-TIMEZONE_OFFSET = -5  # EST
+TIMEZONE_OFFSET = -5  
 DATA_FILE = "ccu_stats_v3.json"
+
+# Set a manual floor for ATH so it doesn't ping for small numbers initially
+ROBLOX_HISTORICAL_PEAK = 23798 
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# --- DATABASE LOGIC ---
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f: return json.load(f)
-    return {"stats": {"weekday": {}, "weekend": {}}, "ath": 0}
+    # If no file exists, use the historical peak as the starting ATH
+    return {"stats": {"weekday": {}, "weekend": {}}, "ath": ROBLOX_HISTORICAL_PEAK}
 
 def save_snapshot(is_weekend, hour, ccu):
     data = load_data()
     group = "weekend" if is_weekend else "weekday"
     hour_key = str(hour)
     
-    # Update Averages
     if hour_key not in data["stats"][group]: data["stats"][group][hour_key] = []
     data["stats"][group][hour_key].append(ccu)
     data["stats"][group][hour_key] = data["stats"][group][hour_key][-30:]
     
-    # Update ATH
     is_new_ath = False
     if ccu > data["ath"]:
         data["ath"] = ccu
@@ -47,7 +47,6 @@ def get_diff_data(current, historical):
     sign = "+" if diff >= 0 else ""
     return pct, f"{sign}{diff:,} ({sign}{pct:.1f}%)"
 
-# --- TRACKING STATE ---
 history = {"last_tick": None, "midnight_est": None, "last_day": None}
 
 def run_tick():
@@ -66,41 +65,46 @@ def run_tick():
             history["last_day"] = now_est.date()
 
         pct_15m, d_15m = get_diff_data(ccu, history["last_tick"])
-        pct_24h, d_24h = get_diff_data(ccu, history["midnight_est"])
         pct_avg, d_avg = get_diff_data(ccu, avg_hour)
+        _, d_24h = get_diff_data(ccu, history["midnight_est"])
 
-        # --- LOGIC & FORMATTING ---
-        is_volatile = abs(pct_15m) >= VOLATILITY_THRESHOLD and history["last_tick"] is not None
-        
-        # We use standard text for Title to avoid the Latin-1 encoding error
-        title = f"FF2 Update: {ccu:,} CCU"
-        if is_new_ath: title = f"🏆 NEW RECORD: {ccu:,} CCU"
-        elif is_volatile: title = f"VOLATILITY ALERT: {ccu:,} CCU"
+        # --- FIX: HEADER SAFETY ---
+        # .strip() removes any accidental leading/trailing spaces that cause the crash
+        if is_new_ath:
+            title = f"NEW RECORD: {ccu:,} CCU".strip()
+            priority = "5"
+            tags = "trophy,fire"
+        elif abs(pct_15m) > 20:
+            title = f"VOLATILITY ALERT: {ccu:,} CCU".strip()
+            priority = "4"
+            tags = "warning,chart_with_upwards_trend"
+        else:
+            title = f"{GAME_NAME} Ticker: {ccu:,}".strip()
+            priority = "3"
+            tags = "football"
 
-        # TradingView Style Body (Encoded to UTF-8 to handle emojis)
         trend_emoji = "🟩" if ccu >= avg_hour else "🟥"
         message = (
             f"{trend_emoji} vs {now_est.strftime('%I%p')} Avg: {d_avg}\n"
-            f"● 15m Change: {d_15m}\n"
+            f"● 15m Tick: {d_15m}\n"
             f"● Since 12AM EST: {d_24h}\n"
-            f"● ATH (Session): {ath:,}\n"
+            f"● Session High: {ath:,}\n"
             f"---------------------------\n"
             f"MARKET: {'🔥 BREAKOUT' if pct_avg > 15 else '📉 BELOW AVG' if pct_avg < -15 else '⚖️ NORMAL'}"
         )
 
-        # Send to ntfy
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=message.encode('utf-8'), # Encoding the BODY is safe
+            data=message.encode('utf-8'),
             headers={
-                "Title": title.encode('ascii', 'ignore').decode('ascii'), # Strips emojis from title to fix your error
-                "Priority": "5" if (is_volatile or is_new_ath) else "3",
-                "Tags": "chart_with_upwards_trend,football" if ccu >= avg_hour else "chart_with_downwards_trend,football"
+                "Title": title,
+                "Priority": priority,
+                "Tags": tags
             }
         )
 
         history["last_tick"] = ccu
-        print(f"[{now_est.strftime('%H:%M')}] CCU: {ccu} | ATH: {ath}")
+        print(f"[{now_est.strftime('%H:%M')}] {ccu} (Avg: {avg_hour:.0f})")
 
     except Exception as e:
         print(f"Loop Error: {e}")

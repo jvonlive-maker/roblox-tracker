@@ -500,5 +500,8 @@ if __name__ == "__main__":
 
         if not _shutdown:
             run_tick()
+            # Sleep 5s after each tick so the next seconds_until_next_quarter()
+            # call never returns 0 and fires a second time on the same mark
+            time.sleep(5)
 
     log.info("Ticker stopped cleanly.")

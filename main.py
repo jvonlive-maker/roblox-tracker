@@ -2,7 +2,7 @@
 FF2 CCU Ticker
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Polls Roblox every 15 min, sends ntfy notification + chart.
-State persists across restarts via JSON — no memory loss.
+State persists across restarts via Upstash Redis (free tier).
 Requires: pip install requests matplotlib
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import signal
-import tempfile
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -30,7 +29,7 @@ UNIVERSE_ID            = "3150475059"
 GAME_NAME              = "FF2"
 NTFY_TOPIC             = "CCU_TICKER8312010"
 TIMEZONE_OFFSET        = -5          # EST (UTC-5)
-DATA_FILE              = "ccu_stats_v4.json"
+REDIS_KEY              = "ff2_ccu_data"              # key used in Upstash Redis
 
 ROBLOX_HISTORICAL_PEAK = 23798       # ATH floor — prevents false alerts on fresh data
 
@@ -73,21 +72,43 @@ http = requests.Session()
 http.headers.update(HEADERS)
 
 # ───────────────────────────────────────────────────────────
+# UPSTASH REDIS  —  free persistent storage
+# Set these env vars in Railway → Variables:
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+# ───────────────────────────────────────────────────────────
+REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL",   "")
+REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+
+def _redis(method: str, *parts):
+    """Low-level Upstash REST call. parts = command args e.g. ("GET", "mykey")."""
+    if not REDIS_URL or not REDIS_TOKEN:
+        raise RuntimeError("UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set")
+    url = f"{REDIS_URL}/{'/'.join(str(p) for p in parts)}"
+    r   = http.request(method, url,
+                       headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                       timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+# ───────────────────────────────────────────────────────────
 # DATA  —  load / save / snapshot
 # ───────────────────────────────────────────────────────────
 def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                data = json.load(f)
+    try:
+        result = _redis("GET", "GET", REDIS_KEY)
+        raw    = result.get("result")
+        if raw:
+            data = json.loads(raw)
             data.setdefault("ath",     ROBLOX_HISTORICAL_PEAK)
             data["ath"] = max(data["ath"], ROBLOX_HISTORICAL_PEAK)
             data.setdefault("stats",   {"weekday": {}, "weekend": {}})
             data.setdefault("session", {})
-            data.setdefault("ticks",   [])   # raw tick log for candle building
+            data.setdefault("ticks",   [])
             return data
-        except Exception as e:
-            log.warning(f"Could not read {DATA_FILE}: {e} — starting fresh.")
+    except Exception as e:
+        log.warning(f"Redis load failed: {e} — starting fresh.")
     return {
         "stats":   {"weekday": {}, "weekend": {}},
         "ath":     ROBLOX_HISTORICAL_PEAK,
@@ -97,12 +118,12 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
-    """Atomic write — temp + os.replace prevents mid-write corruption."""
-    dir_name = os.path.dirname(DATA_FILE) or "."
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp") as tf:
-        json.dump(data, tf, indent=2)
-        tmp = tf.name
-    os.replace(tmp, DATA_FILE)
+    """Write JSON blob to Upstash Redis."""
+    try:
+        payload = json.dumps(data, separators=(",", ":"))
+        _redis("GET", "SET", REDIS_KEY, payload)
+    except Exception as e:
+        log.error(f"Redis save failed: {e}")
 
 
 def record_snapshot(data: dict, is_weekend: bool, hour: int,
@@ -393,7 +414,10 @@ def run_tick():
     # ── Midnight rollover ────────────────────────────────────────
     if state.last_date != today:
         if state.last_date is not None:
+            log.info('Day rollover detected — sending daily summary.')
             send_daily_summary()
+        else:
+            log.info(f'First tick of session ({today}) — intraday tracking started.')
         state.intraday_high  = 0
         state.intraday_low   = 10_000_000
         state.intraday_sum   = 0
@@ -484,10 +508,9 @@ def seconds_until_next_quarter() -> int:
 
 
 if __name__ == "__main__":
-    log.info(f"Starting {GAME_NAME} ticker → ntfy topic: {NTFY_TOPIC}")
-
-    # Restore state from disk before first tick
+    # Restore state FIRST so start banner reflects real state
     restore_state(load_data())
+    log.info(f"Starting {GAME_NAME} ticker → ntfy topic: {NTFY_TOPIC}")
 
     while not _shutdown:
         wait = seconds_until_next_quarter()

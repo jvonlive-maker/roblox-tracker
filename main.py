@@ -1,159 +1,504 @@
-import requests
-import time
+"""
+FF2 CCU Ticker
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Polls Roblox every 15 min, sends ntfy notification + chart.
+State persists across restarts via JSON — no memory loss.
+Requires: pip install requests matplotlib
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import io
 import json
+import logging
 import os
+import signal
+import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 
-# --- CONFIGURATION ---
-UNIVERSE_ID = "3150475059" 
-GAME_NAME = "FF2"
-NTFY_TOPIC = "CCU_TICKER8312010" 
-CHECK_INTERVAL = 900 # 15 Minutes
-TIMEZONE_OFFSET = -5  
-DATA_FILE = "ccu_stats_v4.json"
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+import requests
 
-# Set a manual floor for ATH so it doesn't ping for small numbers initially
-ROBLOX_HISTORICAL_PEAK = 23798 
+# ───────────────────────────────────────────────────────────
+# CONFIGURATION
+# ───────────────────────────────────────────────────────────
+UNIVERSE_ID            = "3150475059"
+GAME_NAME              = "FF2"
+NTFY_TOPIC             = "CCU_TICKER8312010"
+TIMEZONE_OFFSET        = -5          # EST (UTC-5)
+DATA_FILE              = "ccu_stats_v4.json"
+
+ROBLOX_HISTORICAL_PEAK = 23798       # ATH floor — prevents false alerts on fresh data
+
+VOLATILITY_PCT         = 20          # ±% in 15 min triggers spike/drop alert
+BREAKOUT_PCT           = 15          # % above hourly avg
+BELOW_AVG_PCT          = -15         # % below hourly avg
+
+CANDLES                = 5           # how many 1-hr candles to show
+TICKS_PER_CANDLE       = 4           # 4×15min ticks = 1 hr candle
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-def load_data():
+# ───────────────────────────────────────────────────────────
+# LOGGING
+# ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ───────────────────────────────────────────────────────────
+# GRACEFUL SHUTDOWN
+# ───────────────────────────────────────────────────────────
+_shutdown = False
+
+def _handle_signal(sig, frame):
+    global _shutdown
+    log.info("Shutdown signal — finishing current tick then exiting.")
+    _shutdown = True
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+# ───────────────────────────────────────────────────────────
+# HTTP SESSION
+# ───────────────────────────────────────────────────────────
+http = requests.Session()
+http.headers.update(HEADERS)
+
+# ───────────────────────────────────────────────────────────
+# DATA  —  load / save / snapshot
+# ───────────────────────────────────────────────────────────
+def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE, 'r') as f: return json.load(f)
-        except: pass
-    return {"stats": {"weekday": {}, "weekend": {}}, "ath": ROBLOX_HISTORICAL_PEAK}
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+            data.setdefault("ath",     ROBLOX_HISTORICAL_PEAK)
+            data["ath"] = max(data["ath"], ROBLOX_HISTORICAL_PEAK)
+            data.setdefault("stats",   {"weekday": {}, "weekend": {}})
+            data.setdefault("session", {})
+            data.setdefault("ticks",   [])   # raw tick log for candle building
+            return data
+        except Exception as e:
+            log.warning(f"Could not read {DATA_FILE}: {e} — starting fresh.")
+    return {
+        "stats":   {"weekday": {}, "weekend": {}},
+        "ath":     ROBLOX_HISTORICAL_PEAK,
+        "session": {},
+        "ticks":   [],
+    }
 
-def save_snapshot(is_weekend, hour, ccu):
-    data = load_data()
-    group = "weekend" if is_weekend else "weekday"
+
+def save_data(data: dict):
+    """Atomic write — temp + os.replace prevents mid-write corruption."""
+    dir_name = os.path.dirname(DATA_FILE) or "."
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp") as tf:
+        json.dump(data, tf, indent=2)
+        tmp = tf.name
+    os.replace(tmp, DATA_FILE)
+
+
+def record_snapshot(data: dict, is_weekend: bool, hour: int,
+                    ccu: int, now_est: datetime) -> tuple[float, int, bool]:
+    """Appends to hourly stats + raw tick log. Returns (avg, ath, is_new_ath)."""
+    group    = "weekend" if is_weekend else "weekday"
     hour_key = str(hour)
-    
-    if hour_key not in data["stats"][group]: data["stats"][group][hour_key] = []
-    data["stats"][group][hour_key].append(ccu)
-    
-    # Keep last 30 entries (approx 1 week of data per hour slot)
-    data["stats"][group][hour_key] = data["stats"][group][hour_key][-30:]
-    
-    is_new_ath = False
-    if ccu > data["ath"]:
+    slot     = data["stats"][group].setdefault(hour_key, [])
+    slot.append(ccu)
+    data["stats"][group][hour_key] = slot[-30:]
+
+    is_new_ath = ccu > data["ath"]
+    if is_new_ath:
         data["ath"] = ccu
-        is_new_ath = True
-        
-    with open(DATA_FILE, 'w') as f: 
-        json.dump(data, f, indent=2)
-        
+
+    # Raw tick log — keep last 120 ticks (~30 hrs) for candle building
+    data["ticks"].append({"ts": now_est.strftime("%Y-%m-%dT%H:%M"), "ccu": ccu})
+    data["ticks"] = data["ticks"][-120:]
+
     avg = sum(data["stats"][group][hour_key]) / len(data["stats"][group][hour_key])
     return avg, data["ath"], is_new_ath
 
-def get_diff_data(current, historical):
-    if historical is None or historical == 0: 
-        return 0.0, "First Run..."
-    
+# ───────────────────────────────────────────────────────────
+# SESSION STATE  —  survives restarts via JSON
+# ───────────────────────────────────────────────────────────
+class State:
+    last_tick:      int | None = None
+    midnight_ccu:   int | None = None
+    last_date:      object     = None
+    intraday_high:  int        = 0
+    intraday_low:   int        = 10_000_000
+    intraday_sum:   int        = 0
+    intraday_ticks: int        = 0
+
+state = State()
+
+
+def restore_state(data: dict):
+    s = data.get("session", {})
+    state.last_tick    = s.get("last_tick")
+    state.midnight_ccu = s.get("midnight_ccu")
+
+    now_est   = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
+    today_str = now_est.date().isoformat()
+    saved     = s.get("last_date")
+
+    if saved == today_str:
+        state.last_date      = now_est.date()
+        state.intraday_high  = s.get("intraday_high",  0)
+        state.intraday_low   = s.get("intraday_low",   10_000_000)
+        state.intraday_sum   = s.get("intraday_sum",   0)
+        state.intraday_ticks = s.get("intraday_ticks", 0)
+        prev = f"{state.last_tick:,}" if state.last_tick else "none"
+        log.info(f"Resumed state from {saved} — last CCU: {prev}")
+    else:
+        log.info(f"New day ({today_str}) — intraday state reset")
+
+
+def persist_state(data: dict, now_est: datetime):
+    data["session"] = {
+        "last_tick":      state.last_tick,
+        "midnight_ccu":   state.midnight_ccu,
+        "last_date":      now_est.date().isoformat(),
+        "intraday_high":  state.intraday_high,
+        "intraday_low":   state.intraday_low if state.intraday_low < 10_000_000 else 0,
+        "intraday_sum":   state.intraday_sum,
+        "intraday_ticks": state.intraday_ticks,
+    }
+
+# ───────────────────────────────────────────────────────────
+# CANDLESTICK CHART  (TradingView dark style)
+# ───────────────────────────────────────────────────────────
+# Colours
+BG      = "#131722"
+PANEL   = "#1E222D"
+GRID    = "#2A2E39"
+TEXT    = "#D1D4DC"
+GREEN   = "#26A69A"
+RED     = "#EF5350"
+AVGLINE = "#F4C430"
+VOLUME  = "#364156"
+
+
+def build_candles(ticks: list[dict]) -> list[dict]:
+    """
+    Group ticks into 1-hr candles (4 ticks each).
+    Returns list of {label, open, high, low, close} dicts, newest last.
+    """
+    # Only use the most recent N complete candles + the in-progress one
+    needed = ticks[-(CANDLES * TICKS_PER_CANDLE):]
+    candles = []
+    for i in range(0, len(needed), TICKS_PER_CANDLE):
+        chunk = needed[i:i + TICKS_PER_CANDLE]
+        if not chunk:
+            continue
+        values = [t["ccu"] for t in chunk]
+        label  = chunk[0]["ts"][11:16]   # "HH:MM" of candle open
+        candles.append({
+            "label": label,
+            "open":  values[0],
+            "close": values[-1],
+            "high":  max(values),
+            "low":   min(values),
+        })
+    return candles[-CANDLES:]
+
+
+def render_chart(ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
+    """Render candlestick chart and return PNG bytes, or None if not enough data."""
+    candles = build_candles(ticks)
+    if len(candles) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(7, 3.2), facecolor=BG)
+    ax.set_facecolor(PANEL)
+
+    xs = range(len(candles))
+
+    for i, c in enumerate(candles):
+        color    = GREEN if c["close"] >= c["open"] else RED
+        body_bot = min(c["open"], c["close"])
+        body_top = max(c["open"], c["close"])
+        body_h   = max(body_top - body_bot, 1)   # minimum 1 so flat candles show
+
+        # Wick
+        ax.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1.2, zorder=2)
+        # Body
+        ax.bar(i, body_h, bottom=body_bot, width=0.55,
+               color=color, edgecolor=color, linewidth=0.5, zorder=3)
+
+    # Hourly avg line
+    ax.axhline(avg_hour, color=AVGLINE, linewidth=1, linestyle="--",
+               label=f"Avg {int(avg_hour):,}", zorder=4)
+
+    # ATH line (only if within chart range)
+    all_vals = [v for c in candles for v in (c["high"], c["low"])]
+    y_min, y_max = min(all_vals), max(all_vals)
+    padding = max((y_max - y_min) * 0.12, 50)
+    if y_min - padding <= ath <= y_max + padding:
+        ax.axhline(ath, color="#9B59B6", linewidth=1, linestyle=":",
+                   label=f"ATH {ath:,}", zorder=4)
+
+    # Axes styling
+    ax.set_xlim(-0.6, len(candles) - 0.4)
+    ax.set_ylim(y_min - padding, y_max + padding)
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels([c["label"] for c in candles], color=TEXT, fontsize=8)
+    ax.yaxis.set_tick_params(labelcolor=TEXT, labelsize=8)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
+    ax.spines[:].set_visible(False)
+    ax.grid(axis="y", color=GRID, linewidth=0.6, zorder=1)
+
+    # Legend
+    legend_handles = [
+        Line2D([0], [0], color=AVGLINE, linewidth=1.5, linestyle="--",
+               label=f"Avg  {int(avg_hour):,}"),
+        mpatches.Patch(color=GREEN, label="Bullish"),
+        mpatches.Patch(color=RED,   label="Bearish"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left",
+              fontsize=7.5, facecolor=PANEL, edgecolor=GRID,
+              labelcolor=TEXT, framealpha=0.9)
+
+    # Title
+    ax.set_title(f"{GAME_NAME}  •  1-hr candles  •  EST",
+                 color=TEXT, fontsize=9, pad=6)
+
+    fig.tight_layout(pad=0.8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+# ───────────────────────────────────────────────────────────
+# FORMATTING HELPERS
+# ───────────────────────────────────────────────────────────
+def diff_label(current: int, historical: int | None) -> tuple[float, str]:
+    if historical is None or historical == 0:
+        return 0.0, "—"
     diff = current - historical
-    pct = (diff / historical * 100)
+    pct  = diff / historical * 100
     sign = "+" if diff >= 0 else ""
     return pct, f"{sign}{diff:,} ({sign}{pct:.1f}%)"
 
-# Persistent session data
-history = {"last_tick": None, "midnight_est": None, "last_day": None}
+# ───────────────────────────────────────────────────────────
+# NTFY  —  text notification + optional image attachment
+# ───────────────────────────────────────────────────────────
+def send_notification(title: str, message: str, priority: str,
+                      tags: str, chart_png: bytes | None = None,
+                      retries: int = 3):
+    url = f"https://ntfy.sh/{NTFY_TOPIC}"
 
+    def _post(attempt: int):
+        hdrs = {
+            "Title":    title.strip(),
+            "Priority": priority,
+            "Tags":     tags,
+            "Markdown": "yes",
+        }
+        if chart_png:
+            # ntfy supports inline image via multipart when using the PUT endpoint
+            # Easiest approach: send chart as attachment via separate PUT call
+            pass
+        r = http.post(url, data=message.encode("utf-8"), headers=hdrs, timeout=10)
+        r.raise_for_status()
+
+    for attempt in range(1, retries + 1):
+        try:
+            _post(attempt)
+            # Send chart as a second message with the image attached (ntfy PUT method)
+            if chart_png:
+                for img_attempt in range(1, retries + 1):
+                    try:
+                        r = http.put(
+                            url,
+                            data=chart_png,
+                            headers={
+                                "Title":       f"📊 {GAME_NAME} Chart",
+                                "Priority":    "1",
+                                "Tags":        "chart_with_upwards_trend",
+                                "Filename":    "chart.png",
+                                "Content-Type": "image/png",
+                            },
+                            timeout=15,
+                        )
+                        r.raise_for_status()
+                        break
+                    except requests.RequestException as e:
+                        wait = 2 ** img_attempt
+                        log.warning(f"Chart send failed (attempt {img_attempt}): {e}. Retry in {wait}s")
+                        time.sleep(wait)
+            return
+        except requests.RequestException as e:
+            wait = 2 ** attempt
+            log.warning(f"ntfy send failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            time.sleep(wait)
+    log.error("All ntfy send attempts failed.")
+
+# ───────────────────────────────────────────────────────────
+# ROBLOX API FETCH
+# ───────────────────────────────────────────────────────────
+def fetch_ccu(retries: int = 3) -> int | None:
+    url = f"https://games.roblox.com/v1/games?universeIds={UNIVERSE_ID}"
+    for attempt in range(1, retries + 1):
+        try:
+            r = http.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()["data"][0]["playing"]
+        except (requests.RequestException, KeyError, IndexError) as e:
+            wait = 2 ** attempt
+            log.warning(f"Roblox API error (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            time.sleep(wait)
+    log.error("All Roblox API attempts failed.")
+    return None
+
+# ───────────────────────────────────────────────────────────
+# DAILY SUMMARY
+# ───────────────────────────────────────────────────────────
+def send_daily_summary():
+    if state.intraday_ticks == 0:
+        return
+    avg  = state.intraday_sum // state.intraday_ticks
+    high = state.intraday_high
+    low  = state.intraday_low
+    msg = (
+        f"🔺 Peak:    {high:,}\n"
+        f"🔻 Trough:  {low:,}\n"
+        f"📊 Avg:     {avg:,}"
+    )
+    send_notification(
+        title    = f"📅 {GAME_NAME} — Daily Summary",
+        message  = msg,
+        priority = "3",
+        tags     = "calendar,bar_chart",
+    )
+    log.info(f"Daily summary — high={high:,} low={low:,} avg={avg:,}")
+
+# ───────────────────────────────────────────────────────────
+# MAIN TICK
+# ───────────────────────────────────────────────────────────
 def run_tick():
-    global history
-    now_est = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
+    now_est    = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
     is_weekend = now_est.weekday() >= 5
-    
+    today      = now_est.date()
+
+    # ── Midnight rollover ────────────────────────────────────────
+    if state.last_date != today:
+        if state.last_date is not None:
+            send_daily_summary()
+        state.intraday_high  = 0
+        state.intraday_low   = 10_000_000
+        state.intraday_sum   = 0
+        state.intraday_ticks = 0
+        state.last_date      = today
+
+    # ── Fetch CCU ────────────────────────────────────────────────
+    ccu = fetch_ccu()
+    if ccu is None:
+        return
+
+    # ── Persist snapshot ─────────────────────────────────────────
+    data = load_data()
+    avg_hour, ath, is_new_ath = record_snapshot(data, is_weekend, now_est.hour, ccu, now_est)
+
+    if state.midnight_ccu is None:
+        state.midnight_ccu = ccu
+
+    # ── Update intraday ──────────────────────────────────────────
+    state.intraday_high   = max(state.intraday_high, ccu)
+    state.intraday_low    = min(state.intraday_low,  ccu)
+    state.intraday_sum   += ccu
+    state.intraday_ticks += 1
+
+    # ── Deltas ───────────────────────────────────────────────────
+    pct_15m, d_15m = diff_label(ccu, state.last_tick)
+    pct_avg, d_avg = diff_label(ccu, int(avg_hour))
+    _,       d_24h = diff_label(ccu, state.midnight_ccu)
+
+    # ── Save everything ──────────────────────────────────────────
+    persist_state(data, now_est)
+    save_data(data)
+
+    # ── Build chart ──────────────────────────────────────────────
+    chart_png = None
     try:
-        # 1. Fetch Data
-        r = requests.get(f"https://games.roblox.com/v1/games?universeIds={UNIVERSE_ID}", headers=HEADERS)
-        if r.status_code != 200:
-            print(f"API Error: {r.status_code}")
-            return
-            
-        res_data = r.json()
-        if not res_data.get('data'):
-            print("API Error: No data found for Universe ID")
-            return
-
-        ccu = res_data['data'][0]['playing']
-        avg_hour, ath, is_new_ath = save_snapshot(is_weekend, now_est.hour, ccu)
-        
-        # 2. Handle Midnight Reset Logic
-        if history["last_day"] != now_est.date():
-            history["midnight_est"] = ccu
-            history["last_day"] = now_est.date()
-
-        # 3. Calculate Deltas
-        pct_15m, d_15m = get_diff_data(ccu, history["last_tick"])
-        pct_avg, d_avg = get_diff_data(ccu, avg_hour)
-        _, d_24h = get_diff_data(ccu, history["midnight_est"])
-
-        # 4. Determine Notification Urgency
-        if is_new_ath:
-            title = f"🏆 NEW RECORD: {ccu:,}"
-            priority = "5"
-            tags = "tada,fire"
-        elif abs(pct_15m) > 20 and history["last_tick"] is not None:
-            title = f"⚠️ VOLATILITY: {ccu:,}"
-            priority = "4"
-            tags = "chart_with_upwards_trend,warning"
-        else:
-            title = f"{GAME_NAME} Ticker: {ccu:,}"
-            priority = "3"
-            tags = "football"
-
-        # 5. Format Message
-        trend_status = "🔥 BREAKOUT" if pct_avg > 15 else "📉 BELOW AVG" if pct_avg < -15 else "⚖️ STABLE"
-        
-        message = (
-            f"**Current Status:** {trend_status}\n"
-            f"**━━━━━━━━━━━━━━━━━━━━**\n"
-            f"📊 **Performance vs {now_est.strftime('%I %p')} Avg:**\n"
-            f"└ {d_avg}\n\n"
-            f"⏱️ **Intervals:**\n"
-            f"• 15m Change: {d_15m}\n"
-            f"• Since Midnight: {d_24h}\n\n"
-            f"🌟 **Session High:** {ath:,}\n"
-            f"**━━━━━━━━━━━━━━━━━━━━**"
-        ).strip()
-
-        # 6. Send to ntfy
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=message.encode('utf-8'),
-            headers={
-                "Title": title.strip(),
-                "Priority": priority,
-                "Tags": tags,
-                "Markdown": "yes"
-            }
-        )
-
-        history["last_tick"] = ccu
-        print(f"[{now_est.strftime('%H:%M:%S')}] Tick: {ccu} | Avg: {avg_hour:.0f}")
-
+        chart_png = render_chart(data["ticks"], avg_hour, ath)
     except Exception as e:
-        print(f"Loop Error: {e}")
+        log.warning(f"Chart render failed: {e}")
+
+    # ── Notification urgency ─────────────────────────────────────
+    if is_new_ath:
+        title    = f"🏆 NEW RECORD: {ccu:,}"
+        priority = "5"
+        tags     = "tada,fire"
+    elif state.last_tick is not None and pct_15m > VOLATILITY_PCT:
+        title    = f"📈 SPIKE: {ccu:,}"
+        priority = "4"
+        tags     = "chart_with_upwards_trend,warning"
+    elif state.last_tick is not None and pct_15m < -VOLATILITY_PCT:
+        title    = f"📉 DROP: {ccu:,}"
+        priority = "4"
+        tags     = "chart_with_downwards_trend,warning"
+    else:
+        title    = f"{GAME_NAME} Ticker: {ccu:,}"
+        priority = "3"
+        tags     = "football"
+
+    # ── Trend label ──────────────────────────────────────────────
+    if   pct_avg >  BREAKOUT_PCT:  trend = "🔥 BREAKOUT"
+    elif pct_avg <  BELOW_AVG_PCT: trend = "📉 BELOW AVG"
+    else:                          trend = "⚖️ Stable"
+
+    # ── Clean notification body ──────────────────────────────────
+    time_label = now_est.strftime("%-I:%M %p")
+    message = (
+        f"{trend}\n\n"
+        f"15m       {d_15m}\n"
+        f"vs Avg    {d_avg}  _(avg {int(avg_hour):,})_\n"
+        f"Since ↑   {d_24h}\n\n"
+        f"Today   ↑ {state.intraday_high:,}  ↓ {state.intraday_low:,}\n"
+        f"ATH     🏆 {ath:,}"
+    )
+
+    send_notification(title, message, priority, tags, chart_png)
+
+    state.last_tick = ccu
+    log.info(f"Tick @ {time_label} — CCU: {ccu:,} | Avg: {int(avg_hour):,} | ATH: {ath:,}")
+
+# ───────────────────────────────────────────────────────────
+# CLOCK-SYNCED LOOP
+# ───────────────────────────────────────────────────────────
+def seconds_until_next_quarter() -> int:
+    now     = datetime.now()
+    elapsed = (now.minute % 15) * 60 + now.second
+    secs    = 900 - elapsed
+    return secs if secs < 900 else 0
+
 
 if __name__ == "__main__":
-    print(f"Starting {GAME_NAME} Ticker on topic: {NTFY_TOPIC}")
-    
-    while True:
-        # Get current time and calculate delay to sync with the next 15-min mark
-        now = datetime.now()
-        
-        # Calculate seconds until the next :00, :15, :30, or :45
-        minutes_to_sleep = 14 - (now.minute % 15)
-        seconds_to_sleep = 60 - now.second
-        total_sleep = (minutes_to_sleep * 60) + seconds_to_sleep
-        
-        # If we are exactly on the mark (e.g., 0 seconds left), run immediately
-        if total_sleep > 0 and total_sleep < 900:
-            print(f"Syncing... Next tick in {total_sleep} seconds.")
-            time.sleep(total_sleep)
-        
-        run_tick()
-        
-        # After running, wait a tiny bit to ensure we aren't in the same second
-        # when we re-calculate the sleep for the next interval
-        time.sleep(1)
+    log.info(f"Starting {GAME_NAME} ticker → ntfy topic: {NTFY_TOPIC}")
+
+    # Restore state from disk before first tick
+    restore_state(load_data())
+
+    while not _shutdown:
+        wait = seconds_until_next_quarter()
+        if wait > 0:
+            log.info(f"Syncing — next tick in {wait}s")
+            for _ in range(wait):
+                if _shutdown:
+                    break
+                time.sleep(1)
+
+        if not _shutdown:
+            run_tick()
+
+    log.info("Ticker stopped cleanly.")

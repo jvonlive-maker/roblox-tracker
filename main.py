@@ -508,9 +508,21 @@ def seconds_until_next_quarter() -> int:
 
 
 if __name__ == "__main__":
+    # Check Redis env vars are set before doing anything
+    if not REDIS_URL or not REDIS_TOKEN:
+        log.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        log.error("MISSING ENV VARS — Redis not configured. Add these to")
+        log.error("Railway → your service → Variables:")
+        log.error("  UPSTASH_REDIS_REST_URL    = <your REST URL>")
+        log.error("  UPSTASH_REDIS_REST_TOKEN  = <your REST token>")
+        log.error("Get both from console.upstash.com after creating a DB.")
+        log.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        raise SystemExit(1)
+
     # Restore state FIRST so start banner reflects real state
     restore_state(load_data())
     log.info(f"Starting {GAME_NAME} ticker → ntfy topic: {NTFY_TOPIC}")
+    log.info(f"Redis connected: {REDIS_URL[:40]}...")
 
     while not _shutdown:
         wait = seconds_until_next_quarter()

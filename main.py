@@ -19,7 +19,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f: return json.load(f)
+        try:
+            with open(DATA_FILE, 'r') as f: return json.load(f)
+        except: pass
     return {"stats": {"weekday": {}, "weekend": {}}, "ath": ROBLOX_HISTORICAL_PEAK}
 
 def save_snapshot(is_weekend, hour, ccu):
@@ -29,6 +31,7 @@ def save_snapshot(is_weekend, hour, ccu):
     
     if hour_key not in data["stats"][group]: data["stats"][group][hour_key] = []
     data["stats"][group][hour_key].append(ccu)
+    
     # Keep last 30 entries (approx 1 week of data per hour slot)
     data["stats"][group][hour_key] = data["stats"][group][hour_key][-30:]
     
@@ -37,7 +40,9 @@ def save_snapshot(is_weekend, hour, ccu):
         data["ath"] = ccu
         is_new_ath = True
         
-    with open(DATA_FILE, 'w') as f: json.dump(data, f)
+    with open(DATA_FILE, 'w') as f: 
+        json.dump(data, f, indent=2)
+        
     avg = sum(data["stats"][group][hour_key]) / len(data["stats"][group][hour_key])
     return avg, data["ath"], is_new_ath
 
@@ -48,7 +53,6 @@ def get_diff_data(current, historical):
     diff = current - historical
     pct = (diff / historical * 100)
     sign = "+" if diff >= 0 else ""
-    # Returns raw percent and a formatted string
     return pct, f"{sign}{diff:,} ({sign}{pct:.1f}%)"
 
 # Persistent session data
@@ -66,10 +70,15 @@ def run_tick():
             print(f"API Error: {r.status_code}")
             return
             
-        ccu = r.json()['data'][0]['playing']
+        res_data = r.json()
+        if not res_data.get('data'):
+            print("API Error: No data found for Universe ID")
+            return
+
+        ccu = res_data['data'][0]['playing']
         avg_hour, ath, is_new_ath = save_snapshot(is_weekend, now_est.hour, ccu)
         
-        # 2. Handle Time Logic
+        # 2. Handle Midnight Reset Logic
         if history["last_day"] != now_est.date():
             history["midnight_est"] = ccu
             history["last_day"] = now_est.date()
@@ -93,10 +102,9 @@ def run_tick():
             priority = "3"
             tags = "football"
 
-        # 5. Format Beautiful Message
+        # 5. Format Message
         trend_status = "🔥 BREAKOUT" if pct_avg > 15 else "📉 BELOW AVG" if pct_avg < -15 else "⚖️ STABLE"
         
-        # Using Markdown-style formatting for better readability
         message = (
             f"**Current Status:** {trend_status}\n"
             f"**━━━━━━━━━━━━━━━━━━━━**\n"
@@ -117,18 +125,35 @@ def run_tick():
                 "Title": title.strip(),
                 "Priority": priority,
                 "Tags": tags,
-                "Markdown": "yes" # Tells ntfy to render bolding/bullets
+                "Markdown": "yes"
             }
         )
 
         history["last_tick"] = ccu
-        print(f"[{now_est.strftime('%H:%M')}] Tick: {ccu} | Avg: {avg_hour:.0f}")
+        print(f"[{now_est.strftime('%H:%M:%S')}] Tick: {ccu} | Avg: {avg_hour:.0f}")
 
     except Exception as e:
         print(f"Loop Error: {e}")
 
 if __name__ == "__main__":
     print(f"Starting {GAME_NAME} Ticker on topic: {NTFY_TOPIC}")
+    
     while True:
+        # Get current time and calculate delay to sync with the next 15-min mark
+        now = datetime.now()
+        
+        # Calculate seconds until the next :00, :15, :30, or :45
+        minutes_to_sleep = 14 - (now.minute % 15)
+        seconds_to_sleep = 60 - now.second
+        total_sleep = (minutes_to_sleep * 60) + seconds_to_sleep
+        
+        # If we are exactly on the mark (e.g., 0 seconds left), run immediately
+        if total_sleep > 0 and total_sleep < 900:
+            print(f"Syncing... Next tick in {total_sleep} seconds.")
+            time.sleep(total_sleep)
+        
         run_tick()
-        time.sleep(CHECK_INTERVAL)
+        
+        # After running, wait a tiny bit to ensure we aren't in the same second
+        # when we re-calculate the sleep for the next interval
+        time.sleep(1)

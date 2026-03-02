@@ -7,6 +7,7 @@ GAME_NAME = "Football Fusion 2"
 NTFY_TOPIC = "CCU_TICKER8312010" 
 CHECK_INTERVAL = 900 
 
+# Standard browser headers to avoid being flagged as a bot
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -16,6 +17,7 @@ last_ccu = None
 
 def run_tick():
     global last_ccu
+    # We use the public games list API which is usually the most stable
     url = f"https://games.roblox.com/v1/games?universeIds={UNIVERSE_ID}"
     
     try:
@@ -33,7 +35,11 @@ def run_tick():
                 status_emoji = "📈" if diff > 0 else "📉" if diff < 0 else "↔️"
 
             msg = f"{status_emoji} {GAME_NAME}\nCCU: {current_ccu:,}\nChange: {diff_text}"
-            requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg.encode('utf-8'), headers={"Title": "CCU Update"})
+            
+            # Send to ntfy.sh
+            requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", 
+                          data=msg.encode('utf-8'), 
+                          headers={"Title": "15-Min CCU Update"})
             
             print(f"[{time.strftime('%H:%M:%S')}] {current_ccu} ({diff_text})")
             last_ccu = current_ccu
@@ -42,6 +48,9 @@ def run_tick():
     except Exception as e:
         print(f"Update error: {e}")
 
-while True:
-    run_tick()
-    time.sleep(CHECK_INTERVAL)
+# Start the loop
+if __name__ == "__main__":
+    print(f"Tracker started for {GAME_NAME}...")
+    while True:
+        run_tick()
+        time.sleep(CHECK_INTERVAL)

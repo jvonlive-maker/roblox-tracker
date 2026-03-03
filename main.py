@@ -22,6 +22,8 @@ import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 import requests
 
+from urllib.parse import quote
+
 # ───────────────────────────────────────────────────────────
 # CONFIGURATION
 # ───────────────────────────────────────────────────────────
@@ -319,23 +321,20 @@ def send_notification(title: str, message: str, priority: str,
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
 
     def _post(attempt: int):
+        # We URL-encode Title and Tags to prevent UnicodeEncodeError (Latin-1)
         hdrs = {
-            "Title":    title.strip(),
+            "Title":    quote(title.strip()), 
             "Priority": priority,
-            "Tags":     tags,
+            "Tags":     quote(tags),
             "Markdown": "yes",
         }
-        if chart_png:
-            # ntfy supports inline image via multipart when using the PUT endpoint
-            # Easiest approach: send chart as attachment via separate PUT call
-            pass
+        # The message body is encoded to UTF-8, which is perfectly fine
         r = http.post(url, data=message.encode("utf-8"), headers=hdrs, timeout=10)
         r.raise_for_status()
 
     for attempt in range(1, retries + 1):
         try:
             _post(attempt)
-            # Send chart as a second message with the image attached (ntfy PUT method)
             if chart_png:
                 for img_attempt in range(1, retries + 1):
                     try:
@@ -343,10 +342,11 @@ def send_notification(title: str, message: str, priority: str,
                             url,
                             data=chart_png,
                             headers={
-                                "Title":       f"📊 {GAME_NAME} Chart",
-                                "Priority":    "1",
-                                "Tags":        "chart_with_upwards_trend",
-                                "Filename":    "chart.png",
+                                # Use quote() here as well for the chart title/tags
+                                "Title":        quote(f"📊 {GAME_NAME} Chart"),
+                                "Priority":     "1",
+                                "Tags":         quote("chart_with_upwards_trend"),
+                                "Filename":     "chart.png",
                                 "Content-Type": "image/png",
                             },
                             timeout=15,

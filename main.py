@@ -14,6 +14,7 @@ import os
 import signal
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 import matplotlib
 matplotlib.use("Agg")
@@ -22,8 +23,6 @@ import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 import requests
 
-from urllib.parse import quote
-
 # ───────────────────────────────────────────────────────────
 # CONFIGURATION
 # ───────────────────────────────────────────────────────────
@@ -31,13 +30,13 @@ UNIVERSE_ID            = "3150475059"
 GAME_NAME              = "FF2"
 NTFY_TOPIC             = "CCU_TICKER8312010"
 TIMEZONE_OFFSET        = -5          # EST (UTC-5)
-REDIS_KEY              = "ff2_ccu_data"              # key used in Upstash Redis
+REDIS_KEY              = "ff2_ccu_data"
 
 ROBLOX_HISTORICAL_PEAK = 23798       # ATH floor — prevents false alerts on fresh data
 
 VOLATILITY_PCT         = 20          # ±% in 15 min triggers spike/drop alert
 BREAKOUT_PCT           = 15          # % above hourly avg
-BELOW_AVG_PCT          = -15         # % below hourly avg
+DROP_AVG_PCT           = 15          # % below hourly avg (positive; comparison is explicit)
 
 CANDLES                = 5           # how many 1-hr candles to show
 TICKS_PER_CANDLE       = 4           # 4×15min ticks = 1 hr candle
@@ -82,16 +81,45 @@ http.headers.update(HEADERS)
 REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL",   "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
-def _redis(method: str, *parts):
-    """Low-level Upstash REST call. parts = command args e.g. ("GET", "mykey")."""
-    if not REDIS_URL or not REDIS_TOKEN:
-        raise RuntimeError("UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set")
-    url = f"{REDIS_URL}/{'/'.join(str(p) for p in parts)}"
-    r   = http.request(method, url,
-                       headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
-                       timeout=10)
+
+def _redis_headers() -> dict:
+    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
+
+def redis_get(key: str) -> str | None:
+    """
+    GET key via Upstash REST API.
+    Returns the string value, or None if key does not exist.
+    """
+    url = f"{REDIS_URL}/get/{quote(key, safe='')}"
+    r   = http.get(url, headers=_redis_headers(), timeout=10)
     r.raise_for_status()
-    return r.json()
+    return r.json().get("result")  # None when key is missing
+
+
+def redis_set(key: str, value: str, retries: int = 3):
+    """
+    SET key value via Upstash REST API (POST with JSON body).
+    Sends the value as a JSON body so arbitrary content is safe.
+    Retries up to `retries` times with exponential back-off.
+    """
+    url     = f"{REDIS_URL}/set/{quote(key, safe='')}"
+    payload = json.dumps([value])          # Upstash accepts ["value"] as body
+    for attempt in range(1, retries + 1):
+        try:
+            r = http.post(
+                url,
+                data=payload,
+                headers={**_redis_headers(), "Content-Type": "application/json"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            return
+        except requests.RequestException as e:
+            wait = 2 ** attempt
+            log.warning(f"Redis SET failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            time.sleep(wait)
+    log.error("All Redis SET attempts failed — data NOT saved this tick.")
 
 
 # ───────────────────────────────────────────────────────────
@@ -99,8 +127,7 @@ def _redis(method: str, *parts):
 # ───────────────────────────────────────────────────────────
 def load_data() -> dict:
     try:
-        result = _redis("GET", "GET", REDIS_KEY)
-        raw    = result.get("result")
+        raw = redis_get(REDIS_KEY)
         if raw:
             data = json.loads(raw)
             data.setdefault("ath",     ROBLOX_HISTORICAL_PEAK)
@@ -120,12 +147,7 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
-    """Write JSON blob to Upstash Redis."""
-    try:
-        payload = json.dumps(data, separators=(",", ":"))
-        _redis("GET", "SET", REDIS_KEY, payload)
-    except Exception as e:
-        log.error(f"Redis save failed: {e}")
+    redis_set(REDIS_KEY, json.dumps(data, separators=(",", ":")))
 
 
 def record_snapshot(data: dict, is_weekend: bool, hour: int,
@@ -141,22 +163,25 @@ def record_snapshot(data: dict, is_weekend: bool, hour: int,
     if is_new_ath:
         data["ath"] = ccu
 
-    # Raw tick log — keep last 120 ticks (~30 hrs) for candle building
-    data["ticks"].append({"ts": now_est.strftime("%Y-%m-%dT%H:%M"), "ccu": ccu})
-    data["ticks"] = data["ticks"][-120:]
+    # Raw tick log — deduplicated by minute, keep last 120 ticks (~30 hrs)
+    tick_ts = now_est.strftime("%Y-%m-%dT%H:%M")
+    if not data["ticks"] or data["ticks"][-1]["ts"] != tick_ts:
+        data["ticks"].append({"ts": tick_ts, "ccu": ccu})
+        data["ticks"] = data["ticks"][-120:]
 
     avg = sum(data["stats"][group][hour_key]) / len(data["stats"][group][hour_key])
     return avg, data["ath"], is_new_ath
 
+
 # ───────────────────────────────────────────────────────────
-# SESSION STATE  —  survives restarts via JSON
+# SESSION STATE  —  survives restarts via Redis JSON
 # ───────────────────────────────────────────────────────────
 class State:
     last_tick:      int | None = None
     midnight_ccu:   int | None = None
     last_date:      object     = None
     intraday_high:  int        = 0
-    intraday_low:   int        = 10_000_000
+    intraday_low:   int | None = None   # None until first tick; avoids false 0 low
     intraday_sum:   int        = 0
     intraday_ticks: int        = 0
 
@@ -175,7 +200,9 @@ def restore_state(data: dict):
     if saved == today_str:
         state.last_date      = now_est.date()
         state.intraday_high  = s.get("intraday_high",  0)
-        state.intraday_low   = s.get("intraday_low",   10_000_000)
+        # Restore None if was never set (stored as null)
+        raw_low = s.get("intraday_low")
+        state.intraday_low   = raw_low if raw_low else None
         state.intraday_sum   = s.get("intraday_sum",   0)
         state.intraday_ticks = s.get("intraday_ticks", 0)
         prev = f"{state.last_tick:,}" if state.last_tick else "none"
@@ -190,15 +217,15 @@ def persist_state(data: dict, now_est: datetime):
         "midnight_ccu":   state.midnight_ccu,
         "last_date":      now_est.date().isoformat(),
         "intraday_high":  state.intraday_high,
-        "intraday_low":   state.intraday_low if state.intraday_low < 10_000_000 else 0,
+        "intraday_low":   state.intraday_low,   # None stored as JSON null — safe
         "intraday_sum":   state.intraday_sum,
         "intraday_ticks": state.intraday_ticks,
     }
 
+
 # ───────────────────────────────────────────────────────────
 # CANDLESTICK CHART  (TradingView dark style)
 # ───────────────────────────────────────────────────────────
-# Colours
 BG      = "#131722"
 PANEL   = "#1E222D"
 GRID    = "#2A2E39"
@@ -206,7 +233,6 @@ TEXT    = "#D1D4DC"
 GREEN   = "#26A69A"
 RED     = "#EF5350"
 AVGLINE = "#F4C430"
-VOLUME  = "#364156"
 
 
 def build_candles(ticks: list[dict]) -> list[dict]:
@@ -214,17 +240,15 @@ def build_candles(ticks: list[dict]) -> list[dict]:
     Group ticks into 1-hr candles (4 ticks each).
     Returns list of {label, open, high, low, close} dicts, newest last.
     """
-    # Only use the most recent N complete candles + the in-progress one
-    needed = ticks[-(CANDLES * TICKS_PER_CANDLE):]
+    needed  = ticks[-(CANDLES * TICKS_PER_CANDLE):]
     candles = []
     for i in range(0, len(needed), TICKS_PER_CANDLE):
         chunk = needed[i:i + TICKS_PER_CANDLE]
         if not chunk:
             continue
         values = [t["ccu"] for t in chunk]
-        label  = chunk[0]["ts"][11:16]   # "HH:MM" of candle open
         candles.append({
-            "label": label,
+            "label": chunk[0]["ts"][11:16],   # "HH:MM" of candle open
             "open":  values[0],
             "close": values[-1],
             "high":  max(values),
@@ -248,27 +272,23 @@ def render_chart(ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
         color    = GREEN if c["close"] >= c["open"] else RED
         body_bot = min(c["open"], c["close"])
         body_top = max(c["open"], c["close"])
-        body_h   = max(body_top - body_bot, 1)   # minimum 1 so flat candles show
+        body_h   = max(body_top - body_bot, 1)
 
-        # Wick
         ax.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1.2, zorder=2)
-        # Body
         ax.bar(i, body_h, bottom=body_bot, width=0.55,
                color=color, edgecolor=color, linewidth=0.5, zorder=3)
 
-    # Hourly avg line
     ax.axhline(avg_hour, color=AVGLINE, linewidth=1, linestyle="--",
                label=f"Avg {int(avg_hour):,}", zorder=4)
 
-    # ATH line (only if within chart range)
     all_vals = [v for c in candles for v in (c["high"], c["low"])]
     y_min, y_max = min(all_vals), max(all_vals)
     padding = max((y_max - y_min) * 0.12, 50)
+
     if y_min - padding <= ath <= y_max + padding:
         ax.axhline(ath, color="#9B59B6", linewidth=1, linestyle=":",
                    label=f"ATH {ath:,}", zorder=4)
 
-    # Axes styling
     ax.set_xlim(-0.6, len(candles) - 0.4)
     ax.set_ylim(y_min - padding, y_max + padding)
     ax.set_xticks(list(xs))
@@ -278,7 +298,6 @@ def render_chart(ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
     ax.spines[:].set_visible(False)
     ax.grid(axis="y", color=GRID, linewidth=0.6, zorder=1)
 
-    # Legend
     legend_handles = [
         Line2D([0], [0], color=AVGLINE, linewidth=1.5, linestyle="--",
                label=f"Avg  {int(avg_hour):,}"),
@@ -289,7 +308,6 @@ def render_chart(ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
               fontsize=7.5, facecolor=PANEL, edgecolor=GRID,
               labelcolor=TEXT, framealpha=0.9)
 
-    # Title
     ax.set_title(f"{GAME_NAME}  •  1-hr candles  •  EST",
                  color=TEXT, fontsize=9, pad=6)
 
@@ -300,6 +318,7 @@ def render_chart(ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
 
 # ───────────────────────────────────────────────────────────
 # FORMATTING HELPERS
@@ -312,6 +331,7 @@ def diff_label(current: int, historical: int | None) -> tuple[float, str]:
     sign = "+" if diff >= 0 else ""
     return pct, f"{sign}{diff:,} ({sign}{pct:.1f}%)"
 
+
 # ───────────────────────────────────────────────────────────
 # NTFY  —  text notification + optional image attachment
 # ───────────────────────────────────────────────────────────
@@ -320,49 +340,55 @@ def send_notification(title: str, message: str, priority: str,
                       retries: int = 3):
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
 
-    def _post(attempt: int):
-        # We URL-encode Title and Tags to prevent UnicodeEncodeError (Latin-1)
-        hdrs = {
-            "Title":    quote(title.strip()), 
-            "Priority": priority,
-            "Tags":     quote(tags),
-            "Markdown": "yes",
-        }
-        # The message body is encoded to UTF-8, which is perfectly fine
-        r = http.post(url, data=message.encode("utf-8"), headers=hdrs, timeout=10)
-        r.raise_for_status()
-
+    # Send text notification
     for attempt in range(1, retries + 1):
         try:
-            _post(attempt)
-            if chart_png:
-                for img_attempt in range(1, retries + 1):
-                    try:
-                        r = http.put(
-                            url,
-                            data=chart_png,
-                            headers={
-                                # Use quote() here as well for the chart title/tags
-                                "Title":        quote(f"📊 {GAME_NAME} Chart"),
-                                "Priority":     "1",
-                                "Tags":         quote("chart_with_upwards_trend"),
-                                "Filename":     "chart.png",
-                                "Content-Type": "image/png",
-                            },
-                            timeout=15,
-                        )
-                        r.raise_for_status()
-                        break
-                    except requests.RequestException as e:
-                        wait = 2 ** img_attempt
-                        log.warning(f"Chart send failed (attempt {img_attempt}): {e}. Retry in {wait}s")
-                        time.sleep(wait)
-            return
+            r = http.post(
+                url,
+                data=message.encode("utf-8"),
+                headers={
+                    "Title":    quote(title.strip()),
+                    "Priority": priority,
+                    "Tags":     quote(tags),
+                    "Markdown": "yes",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            break
         except requests.RequestException as e:
             wait = 2 ** attempt
-            log.warning(f"ntfy send failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            log.warning(f"ntfy text send failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            if attempt == retries:
+                log.error("All ntfy text send attempts failed.")
+                return
             time.sleep(wait)
-    log.error("All ntfy send attempts failed.")
+
+    # Send chart as separate attachment (if available)
+    if chart_png:
+        for attempt in range(1, retries + 1):
+            try:
+                r = http.put(
+                    url,
+                    data=chart_png,
+                    headers={
+                        "Title":        quote(f"📊 {GAME_NAME} Chart"),
+                        "Priority":     "1",
+                        "Tags":         quote("chart_with_upwards_trend"),
+                        "Filename":     "chart.png",
+                        "Content-Type": "image/png",
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
+                break
+            except requests.RequestException as e:
+                wait = 2 ** attempt
+                log.warning(f"Chart send failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+                if attempt == retries:
+                    log.warning("Chart failed to send — text notification was still delivered.")
+                time.sleep(wait)
+
 
 # ───────────────────────────────────────────────────────────
 # ROBLOX API FETCH
@@ -381,6 +407,7 @@ def fetch_ccu(retries: int = 3) -> int | None:
     log.error("All Roblox API attempts failed.")
     return None
 
+
 # ───────────────────────────────────────────────────────────
 # DAILY SUMMARY
 # ───────────────────────────────────────────────────────────
@@ -389,7 +416,7 @@ def send_daily_summary():
         return
     avg  = state.intraday_sum // state.intraday_ticks
     high = state.intraday_high
-    low  = state.intraday_low
+    low  = state.intraday_low if state.intraday_low is not None else 0
     msg = (
         f"🔺 Peak:    {high:,}\n"
         f"🔻 Trough:  {low:,}\n"
@@ -403,6 +430,7 @@ def send_daily_summary():
     )
     log.info(f"Daily summary — high={high:,} low={low:,} avg={avg:,}")
 
+
 # ───────────────────────────────────────────────────────────
 # MAIN TICK
 # ───────────────────────────────────────────────────────────
@@ -414,12 +442,12 @@ def run_tick():
     # ── Midnight rollover ────────────────────────────────────────
     if state.last_date != today:
         if state.last_date is not None:
-            log.info('Day rollover detected — sending daily summary.')
+            log.info("Day rollover detected — sending daily summary.")
             send_daily_summary()
         else:
-            log.info(f'First tick of session ({today}) — intraday tracking started.')
+            log.info(f"First tick of session ({today}) — intraday tracking started.")
         state.intraday_high  = 0
-        state.intraday_low   = 10_000_000
+        state.intraday_low   = None
         state.intraday_sum   = 0
         state.intraday_ticks = 0
         state.last_date      = today
@@ -438,7 +466,7 @@ def run_tick():
 
     # ── Update intraday ──────────────────────────────────────────
     state.intraday_high   = max(state.intraday_high, ccu)
-    state.intraday_low    = min(state.intraday_low,  ccu)
+    state.intraday_low    = ccu if state.intraday_low is None else min(state.intraday_low, ccu)
     state.intraday_sum   += ccu
     state.intraday_ticks += 1
 
@@ -478,17 +506,18 @@ def run_tick():
 
     # ── Trend label ──────────────────────────────────────────────
     if   pct_avg >  BREAKOUT_PCT:  trend = "🔥 BREAKOUT"
-    elif pct_avg <  BELOW_AVG_PCT: trend = "📉 BELOW AVG"
+    elif pct_avg < -DROP_AVG_PCT:  trend = "📉 BELOW AVG"
     else:                          trend = "⚖️ Stable"
 
-    # ── Clean notification body ──────────────────────────────────
+    # ── Notification body ────────────────────────────────────────
     time_label = now_est.strftime("%-I:%M %p")
+    low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
     message = (
         f"{trend}\n\n"
         f"15m       {d_15m}\n"
         f"vs Avg    {d_avg}  _(avg {int(avg_hour):,})_\n"
         f"Since ↑   {d_24h}\n\n"
-        f"Today   ↑ {state.intraday_high:,}  ↓ {state.intraday_low:,}\n"
+        f"Today   ↑ {state.intraday_high:,}  ↓ {low_display}\n"
         f"ATH     🏆 {ath:,}"
     )
 
@@ -497,18 +526,18 @@ def run_tick():
     state.last_tick = ccu
     log.info(f"Tick @ {time_label} — CCU: {ccu:,} | Avg: {int(avg_hour):,} | ATH: {ath:,}")
 
+
 # ───────────────────────────────────────────────────────────
 # CLOCK-SYNCED LOOP
 # ───────────────────────────────────────────────────────────
 def seconds_until_next_quarter() -> int:
+    """Returns seconds until the next :00/:15/:30/:45 mark. Always 1–900."""
     now     = datetime.now()
     elapsed = (now.minute % 15) * 60 + now.second
-    secs    = 900 - elapsed
-    return secs if secs < 900 else 0
+    return 900 - elapsed
 
 
 if __name__ == "__main__":
-    # Check Redis env vars are set before doing anything
     if not REDIS_URL or not REDIS_TOKEN:
         log.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         log.error("MISSING ENV VARS — Redis not configured. Add these to")
@@ -519,24 +548,21 @@ if __name__ == "__main__":
         log.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         raise SystemExit(1)
 
-    # Restore state FIRST so start banner reflects real state
     restore_state(load_data())
     log.info(f"Starting {GAME_NAME} ticker → ntfy topic: {NTFY_TOPIC}")
     log.info(f"Redis connected: {REDIS_URL[:40]}...")
 
     while not _shutdown:
         wait = seconds_until_next_quarter()
-        if wait > 0:
-            log.info(f"Syncing — next tick in {wait}s")
-            for _ in range(wait):
-                if _shutdown:
-                    break
-                time.sleep(1)
+        log.info(f"Syncing — next tick in {wait}s")
+        for _ in range(wait):
+            if _shutdown:
+                break
+            time.sleep(1)
 
         if not _shutdown:
             run_tick()
-            # Sleep 5s after each tick so the next seconds_until_next_quarter()
-            # call never returns 0 and fires a second time on the same mark
+            # Sleep 5s so next seconds_until_next_quarter() doesn't fire twice
             time.sleep(5)
 
     log.info("Ticker stopped cleanly.")

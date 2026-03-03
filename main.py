@@ -14,6 +14,7 @@ import os
 import signal
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 import matplotlib
 matplotlib.use("Agg")

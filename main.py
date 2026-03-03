@@ -14,7 +14,6 @@ import os
 import signal
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
 
 import matplotlib
 matplotlib.use("Agg")
@@ -335,6 +334,17 @@ def diff_label(current: int, historical: int | None) -> tuple[float, str]:
 # ───────────────────────────────────────────────────────────
 # NTFY  —  text notification + optional image attachment
 # ───────────────────────────────────────────────────────────
+def _ntfy_headers(extra: dict) -> dict:
+    """
+    Build ntfy headers, encoding string values as UTF-8 bytes so that
+    requests sends them with the correct charset — NOT percent-encoded.
+    ntfy parses header values as UTF-8; using quote() was wrong and
+    caused titles like 'FF2%20Ticker%3A%20551'.
+    """
+    return {k: v.encode("utf-8") if isinstance(v, str) else v
+            for k, v in extra.items()}
+
+
 def send_notification(title: str, message: str, priority: str,
                       tags: str, chart_png: bytes | None = None,
                       retries: int = 3):
@@ -346,12 +356,12 @@ def send_notification(title: str, message: str, priority: str,
             r = http.post(
                 url,
                 data=message.encode("utf-8"),
-                headers={
-                    "Title":    quote(title.strip()),
+                headers=_ntfy_headers({
+                    "Title":    title.strip(),
                     "Priority": priority,
-                    "Tags":     quote(tags),
+                    "Tags":     tags,
                     "Markdown": "yes",
-                },
+                }),
                 timeout=10,
             )
             r.raise_for_status()
@@ -371,13 +381,13 @@ def send_notification(title: str, message: str, priority: str,
                 r = http.put(
                     url,
                     data=chart_png,
-                    headers={
-                        "Title":        quote(f"📊 {GAME_NAME} Chart"),
+                    headers=_ntfy_headers({
+                        "Title":        f"📊 {GAME_NAME} Chart",
                         "Priority":     "1",
-                        "Tags":         quote("chart_with_upwards_trend"),
+                        "Tags":         "chart_with_upwards_trend",
                         "Filename":     "chart.png",
                         "Content-Type": "image/png",
-                    },
+                    }),
                     timeout=15,
                 )
                 r.raise_for_status()

@@ -650,28 +650,34 @@ def run_tick():
     elif pct_avg < -DROP_AVG_PCT:  trend = "📉 BELOW AVG"
     else:                          trend = "⚖️ Stable"
 
-    # ── Forecast line (next 1-2 hr avgs) ─────────────────────────
+    # ── Forecast ─────────────────────────────────────────────────
     forecast_parts = []
     if sig["next1_avg"] is not None:
         forecast_parts.append(f"{int(sig['next1_avg']):,}")
     if sig["next2_avg"] is not None:
         forecast_parts.append(f"{int(sig['next2_avg']):,}")
-    forecast_str = " → ".join(forecast_parts) if forecast_parts else "not enough data"
+    forecast_str = " → ".join(forecast_parts) if forecast_parts else "—"
 
     # ── Notification body ────────────────────────────────────────
     time_label  = now_est.strftime("%-I:%M %p")
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
+
+    pct_str   = f"{(ccu - sig['curr_avg']) / sig['curr_avg'] * 100:+.1f}%" if sig["curr_avg"] else ""
+    sig_line1 = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']} confidence"
+    sig_line2 = f"CCU {pct_str} vs avg  •  Next: {forecast_str}"
+
     message = (
-        f"{trend}\n\n"
-        f"15m       {d_15m}\n"
-        f"vs Avg    {d_avg}  (avg {int(avg_hour):,})\n"
-        f"Since ↑   {d_24h}\n\n"
-        f"Today   ↑ {state.intraday_high:,}  ↓ {low_display}\n"
-        f"ATH     🏆 {ath:,}\n\n"
-        f"── Signal ──────────────────\n"
-        f"{sig_emoji} {sig['signal']}  ({sig['confidence']} confidence)\n"
-        f"{sig['reasoning']}\n"
-        f"Forecast:  {forecast_str}"
+        f"{trend}  •  {time_label}\n"
+        f"\n"
+        f"CCU      {ccu:,}\n"
+        f"15m      {d_15m}\n"
+        f"vs Avg   {d_avg}\n"
+        f"Since ↑  {d_24h}\n"
+        f"\n"
+        f"↑ {state.intraday_high:,}  ↓ {low_display}  •  ATH 🏆 {ath:,}\n"
+        f"\n"
+        f"{sig_line1}\n"
+        f"{sig_line2}"
     )
 
     send_notification(title, message, priority, tags, chart_png)

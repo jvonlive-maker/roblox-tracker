@@ -23,6 +23,14 @@ GAMES = [
         "ath_floor":   23798,
         "csv_seed":    "ff2_players.csv",       # rename your CSV to this
     },
+    {
+        "name":        "UFLU",
+        "universe_id": "184199275",
+        "redis_key":   "ccu:uflu",
+        "ntfy_topic":  "CCU_TICKER11222019",
+        "ath_floor":   37813,
+        "csv_seed":    "uflu_players.csv",       # rename your CSV to this
+    },
     # Add more games below — uncomment and fill in:
     # {
     #     "name":        "Jailbreak",

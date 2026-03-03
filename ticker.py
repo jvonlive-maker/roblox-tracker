@@ -3,13 +3,12 @@ ticker.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Multi-game Roblox CCU ticker.
 - Polls every game in config.GAMES every 15 min
-- Sends alerts to ntfy (per-game topic) + Discord (shared webhook)
+- Sends alerts to Discord webhook
 - Persists all state in Upstash Redis
-Requires: pip install requests matplotlib
+Requires: pip install requests
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import io
 import json
 import logging
 import os
@@ -18,11 +17,6 @@ import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
 import requests
 
 import config
@@ -229,59 +223,6 @@ def build_candles(ticks: list[dict]) -> list[dict]:
     return candles[-config.CANDLES:]
 
 
-def render_chart(game: dict, ticks: list[dict], avg_hour: float, ath: int) -> bytes | None:
-    candles = build_candles(ticks)
-    if len(candles) < 2:
-        return None
-
-    fig, ax = plt.subplots(figsize=(7, 3.2), facecolor=BG)
-    ax.set_facecolor(PANEL)
-
-    for i, c in enumerate(candles):
-        color    = GREEN if c["close"] >= c["open"] else RED
-        body_bot = min(c["open"], c["close"])
-        body_top = max(c["open"], c["close"])
-        body_h   = max(body_top - body_bot, 1)
-        ax.plot([i, i], [c["low"], c["high"]], color=color, linewidth=1.2, zorder=2)
-        ax.bar(i, body_h, bottom=body_bot, width=0.55,
-               color=color, edgecolor=color, linewidth=0.5, zorder=3)
-
-    ax.axhline(avg_hour, color=AVGLINE, linewidth=1, linestyle="--", zorder=4)
-
-    all_vals = [v for c in candles for v in (c["high"], c["low"])]
-    y_min, y_max = min(all_vals), max(all_vals)
-    padding = max((y_max - y_min) * 0.12, 50)
-
-    if y_min - padding <= ath <= y_max + padding:
-        ax.axhline(ath, color="#9B59B6", linewidth=1, linestyle=":", zorder=4)
-
-    ax.set_xlim(-0.6, len(candles) - 0.4)
-    ax.set_ylim(y_min - padding, y_max + padding)
-    ax.set_xticks(list(range(len(candles))))
-    ax.set_xticklabels([c["label"] for c in candles], color=TEXT, fontsize=8)
-    ax.yaxis.set_tick_params(labelcolor=TEXT, labelsize=8)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
-    ax.spines[:].set_visible(False)
-    ax.grid(axis="y", color=GRID, linewidth=0.6, zorder=1)
-
-    legend_handles = [
-        Line2D([0], [0], color=AVGLINE, linewidth=1.5, linestyle="--",
-               label=f"Avg  {int(avg_hour):,}"),
-        mpatches.Patch(color=GREEN, label="Bullish"),
-        mpatches.Patch(color=RED,   label="Bearish"),
-    ]
-    ax.legend(handles=legend_handles, loc="upper left",
-              fontsize=7.5, facecolor=PANEL, edgecolor=GRID,
-              labelcolor=TEXT, framealpha=0.9)
-    ax.set_title(f"{game['name']}  •  1-hr candles  •  EST",
-                 color=TEXT, fontsize=9, pad=6)
-    fig.tight_layout(pad=0.8)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=130, facecolor=BG)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
 
 
 # ───────────────────────────────────────────────────────────
@@ -379,63 +320,9 @@ def compute_signal(data: dict, ccu: int, hour: int, is_weekend: bool) -> dict:
 # ───────────────────────────────────────────────────────────
 # NTFY
 # ───────────────────────────────────────────────────────────
-def _ntfy_headers(extra: dict) -> dict:
-    return {k: v.encode("utf-8") if isinstance(v, str) else v
-            for k, v in extra.items()}
-
-
-def send_ntfy(game: dict, title: str, message: str, priority: str,
-              tags: str, chart_png: bytes | None = None, retries: int = 3):
-    if not game.get("ntfy_topic"):
-        return
-    url = f"https://ntfy.sh/{game['ntfy_topic']}"
-
-    for attempt in range(1, retries + 1):
-        try:
-            http.post(url, data=message.encode("utf-8"),
-                      headers=_ntfy_headers({"Title": title, "Priority": priority,
-                                             "Tags": tags, "Markdown": "yes"}),
-                      timeout=10).raise_for_status()
-            break
-        except requests.RequestException as e:
-            if attempt == retries:
-                log.error(f"[{game['name']}] ntfy failed: {e}")
-                return
-            time.sleep(2 ** attempt)
-
-    if chart_png:
-        for attempt in range(1, retries + 1):
-            try:
-                http.put(url, data=chart_png,
-                         headers=_ntfy_headers({
-                             "Title": f"{game['name']} Chart", "Priority": "1",
-                             "Tags": "chart_with_upwards_trend",
-                             "Filename": "chart.png", "Content-Type": "image/png",
-                         }), timeout=15).raise_for_status()
-                break
-            except requests.RequestException as e:
-                if attempt == retries:
-                    log.warning(f"[{game['name']}] Chart send failed: {e}")
-                time.sleep(2 ** attempt)
-
-
-# ───────────────────────────────────────────────────────────
-# DISCORD
-# ───────────────────────────────────────────────────────────
-SIGNAL_COLORS = {
-    "LONG":              0x26A69A,   # teal
-    "SHORT":             0xEF5350,   # red
-    "HOLD":              0xF4C430,   # yellow
-    "INSUFFICIENT DATA": 0x888888,   # grey
-}
-
-SIGNAL_EMOJI = {
-    "LONG": "🟢", "SHORT": "🔴", "HOLD": "🟡", "INSUFFICIENT DATA": "⚪"
-}
-
 
 def send_discord(game: dict, title: str, message: str,
-                 sig: dict, chart_png: bytes | None = None, retries: int = 3):
+                 sig: dict, retries: int = 3):
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
@@ -470,34 +357,13 @@ def send_discord(game: dict, title: str, message: str,
                 return
             time.sleep(2 ** attempt)
 
-    # Send chart as a follow-up file upload if available
-    if chart_png:
-        for attempt in range(1, retries + 1):
-            try:
-                r = http.post(
-                    webhook,
-                    files={"file": ("chart.png", chart_png, "image/png")},
-                    data={"payload_json": json.dumps({"content": ""})},
-                    timeout=15,
-                )
-                if r.status_code == 429:
-                    time.sleep(r.json().get("retry_after", 2))
-                    continue
-                r.raise_for_status()
-                break
-            except requests.RequestException as e:
-                if attempt == retries:
-                    log.warning(f"[{game['name']}] Discord chart failed: {e}")
-                time.sleep(2 ** attempt)
 
 
 # ───────────────────────────────────────────────────────────
 # COMBINED NOTIFY  —  sends to both ntfy + Discord
 # ───────────────────────────────────────────────────────────
-def notify(game: dict, title: str, message: str, priority: str,
-           tags: str, sig: dict, chart_png: bytes | None = None):
-    send_ntfy(game, title, message, priority, tags, chart_png)
-    send_discord(game, title, message, sig, chart_png)
+def notify(game: dict, title: str, message: str, sig: dict):
+    send_discord(game, title, message, sig)
 
 
 # ───────────────────────────────────────────────────────────
@@ -530,8 +396,7 @@ def send_daily_summary(game: dict):
     low  = state.intraday_low or 0
     title   = f"📅 {game['name']} — Daily Summary"
     message = f"↑ {high:,}  ↓ {low:,}  avg {avg:,}"
-    notify(game, title, message, "3", "calendar,bar_chart",
-           {"signal": "HOLD", "confidence": "—", "reasoning": ""})
+    notify(game, title, message, {"signal": "HOLD", "confidence": "—", "reasoning": ""})
     log.info(f"[{game['name']}] Daily summary — high={high:,} low={low:,} avg={avg:,}")
 
 
@@ -576,11 +441,7 @@ def run_tick(game: dict):
     persist_state(game, data, now_est)
     save_data(game, data)
 
-    chart_png = None
-    try:
-        chart_png = render_chart(game, data["ticks"], avg_hour, ath)
-    except Exception as e:
-        log.warning(f"[{game['name']}] Chart render failed: {e}")
+
 
     sig       = compute_signal(data, ccu, now_est.hour, is_weekend)
     sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
@@ -640,7 +501,7 @@ def run_tick(game: dict):
         f"{sig_line2}"
     )
 
-    notify(game, title, message, priority, tags, sig, chart_png)
+    notify(game, title, message, sig)
 
     state.last_tick = ccu
     log.info(f"[{game['name']}] Tick @ {time_label} — CCU: {ccu:,} | Avg: {int(avg_hour):,} | ATH: {ath:,}")

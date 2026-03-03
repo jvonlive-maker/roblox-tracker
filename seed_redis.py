@@ -54,10 +54,10 @@ def redis_get(key: str) -> str | None:
     return r.json().get("result")
 
 def redis_set(key: str, value: str):
-    r = http.post(
-        f"{REDIS_URL}/set/{key}",
-        data=json.dumps({"value": value}),
-        headers={**_hdrs(), "Content-Type": "application/json"},
+    from urllib.parse import quote
+    r = http.get(
+        f"{REDIS_URL}/set/{quote(key, safe='')}/{quote(value, safe='')}",
+        headers=_hdrs(),
         timeout=15,
     )
     r.raise_for_status()

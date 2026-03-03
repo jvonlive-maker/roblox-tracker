@@ -93,32 +93,18 @@ def _redis_headers() -> dict:
 
 
 def redis_get(key: str) -> str | None:
-    """
-    GET key via Upstash REST API.
-    Returns the string value, or None if key does not exist.
-    """
-    url = f"{REDIS_URL}/get/{quote(key, safe='')}"
-    r   = http.get(url, headers=_redis_headers(), timeout=10)
+    url    = f"{REDIS_URL}/get/{quote(key, safe='')}"
+    r      = http.get(url, headers=_redis_headers(), timeout=10)
     r.raise_for_status()
-    return r.json().get("result")  # None when key is missing
+    result = r.json().get("result")
+    return result if isinstance(result, str) else None
 
 
 def redis_set(key: str, value: str, retries: int = 3):
-    """
-    SET key value via Upstash REST API (POST with JSON body).
-    Upstash REST: POST /set/<key>  body={"value": "<string>"}
-    Retries up to `retries` times with exponential back-off.
-    """
-    url     = f"{REDIS_URL}/set/{quote(key, safe='')}"
-    payload = json.dumps({"value": value})
+    url = f"{REDIS_URL}/set/{quote(key, safe='')}/{quote(value, safe='')}"
     for attempt in range(1, retries + 1):
         try:
-            r = http.post(
-                url,
-                data=payload,
-                headers={**_redis_headers(), "Content-Type": "application/json"},
-                timeout=10,
-            )
+            r = http.get(url, headers=_redis_headers(), timeout=10)
             r.raise_for_status()
             return
         except requests.RequestException as e:

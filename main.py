@@ -14,7 +14,6 @@ import os
 import signal
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
 
 import matplotlib
 matplotlib.use("Agg")
@@ -40,6 +39,12 @@ DROP_AVG_PCT           = 15          # % below hourly avg (positive; comparison 
 
 CANDLES                = 5           # how many 1-hr candles to show
 TICKS_PER_CANDLE       = 4           # 4×15min ticks = 1 hr candle
+
+# Signal engine
+SIGNAL_MIN_SAMPLES     = 3           # minimum historical samples needed to emit a signal
+SIGNAL_LONG_PCT        = 8           # CCU must be this % below hour avg to consider LONG
+SIGNAL_SHORT_PCT       = 8           # CCU must be this % above hour avg to consider SHORT
+SIGNAL_TREND_PCT       = 3           # next-hour avg must differ by this % to confirm trend
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -100,11 +105,11 @@ def redis_get(key: str) -> str | None:
 def redis_set(key: str, value: str, retries: int = 3):
     """
     SET key value via Upstash REST API (POST with JSON body).
-    Sends the value as a JSON body so arbitrary content is safe.
+    Upstash REST: POST /set/<key>  body={"value": "<string>"}
     Retries up to `retries` times with exponential back-off.
     """
     url     = f"{REDIS_URL}/set/{quote(key, safe='')}"
-    payload = json.dumps([value])          # Upstash accepts ["value"] as body
+    payload = json.dumps({"value": value})
     for attempt in range(1, retries + 1):
         try:
             r = http.post(
@@ -443,6 +448,130 @@ def send_daily_summary():
 
 
 # ───────────────────────────────────────────────────────────
+# SIGNAL ENGINE  —  LONG / SHORT / HOLD based on history
+# ───────────────────────────────────────────────────────────
+def _hour_avg(stats: dict, group: str, hour: int) -> tuple[float, int] | None:
+    """Returns (avg, sample_count) for a given hour slot, or None if not enough data."""
+    slot = stats[group].get(str(hour % 24), [])
+    if len(slot) < SIGNAL_MIN_SAMPLES:
+        return None
+    return sum(slot) / len(slot), len(slot)
+
+
+def compute_signal(data: dict, ccu: int, hour: int, is_weekend: bool) -> dict:
+    """
+    Analyses current CCU against historical hourly averages for this hour
+    and the next two hours.
+
+    Returns a dict with keys:
+        signal      : "LONG" | "SHORT" | "HOLD" | "INSUFFICIENT DATA"
+        confidence  : "High" | "Medium" | "Low" | "—"
+        reasoning   : human-readable explanation string
+        curr_avg    : float | None
+        next1_avg   : float | None
+        next2_avg   : float | None
+    """
+    group = "weekend" if is_weekend else "weekday"
+    stats = data["stats"]
+
+    curr  = _hour_avg(stats, group, hour)
+    next1 = _hour_avg(stats, group, hour + 1)
+    next2 = _hour_avg(stats, group, hour + 2)
+
+    if curr is None:
+        return {
+            "signal":     "INSUFFICIENT DATA",
+            "confidence": "—",
+            "reasoning":  f"Need {SIGNAL_MIN_SAMPLES}+ samples for hour {hour} — keep collecting.",
+            "curr_avg":   None,
+            "next1_avg":  None,
+            "next2_avg":  None,
+        }
+
+    curr_avg, curr_n = curr
+    next1_avg        = next1[0] if next1 else None
+    next2_avg        = next2[0] if next2 else None
+    pct_vs_now       = (ccu - curr_avg) / curr_avg * 100
+
+    # Determine whether upcoming hours trend up or down vs current avg
+    trend_up   = False
+    trend_down = False
+    trend_str  = "unknown next-hour trend"
+
+    if next1_avg is not None:
+        d1 = (next1_avg - curr_avg) / curr_avg * 100
+        if next2_avg is not None:
+            d2 = (next2_avg - curr_avg) / curr_avg * 100
+            if d1 > SIGNAL_TREND_PCT and d2 > SIGNAL_TREND_PCT:
+                trend_up  = True
+                trend_str = f"hist. avg rises +{d1:.1f}% then +{d2:.1f}% over next 2h"
+            elif d1 < -SIGNAL_TREND_PCT and d2 < -SIGNAL_TREND_PCT:
+                trend_down = True
+                trend_str  = f"hist. avg falls {d1:.1f}% then {d2:.1f}% over next 2h"
+            else:
+                trend_str = f"mixed next 2h ({d1:+.1f}%, {d2:+.1f}%)"
+        else:
+            if d1 > SIGNAL_TREND_PCT:
+                trend_up  = True
+                trend_str = f"hist. avg rises +{d1:.1f}% next hour"
+            elif d1 < -SIGNAL_TREND_PCT:
+                trend_down = True
+                trend_str  = f"hist. avg falls {d1:.1f}% next hour"
+            else:
+                trend_str = f"flat next hour ({d1:+.1f}%)"
+
+    # Confidence score — more samples + more future hours = higher confidence
+    confidence_score = min(curr_n, 20) + (1 if next1 else 0) * 3 + (1 if next2 else 0) * 3
+    if confidence_score >= 18:
+        confidence = "High"
+    elif confidence_score >= 10:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    # Decision
+    if pct_vs_now < -SIGNAL_LONG_PCT and trend_up:
+        signal    = "LONG"
+        reasoning = (
+            f"CCU is {pct_vs_now:.1f}% below the {hour}:00 avg ({curr_avg:,.0f}). "
+            f"{trend_str.capitalize()}. Expect recovery — consider longing."
+        )
+    elif pct_vs_now > SIGNAL_SHORT_PCT and trend_down:
+        signal    = "SHORT"
+        reasoning = (
+            f"CCU is +{pct_vs_now:.1f}% above the {hour}:00 avg ({curr_avg:,.0f}). "
+            f"{trend_str.capitalize()}. Expect pullback — consider shorting."
+        )
+    elif pct_vs_now < -SIGNAL_LONG_PCT:
+        signal    = "HOLD"
+        reasoning = (
+            f"CCU {pct_vs_now:.1f}% below avg but {trend_str} — "
+            f"dip present, no confirmed recovery trend yet."
+        )
+    elif pct_vs_now > SIGNAL_SHORT_PCT:
+        signal    = "HOLD"
+        reasoning = (
+            f"CCU +{pct_vs_now:.1f}% above avg but {trend_str} — "
+            f"elevated but no confirmed drop trend yet."
+        )
+    else:
+        signal    = "HOLD"
+        reasoning = (
+            f"CCU {pct_vs_now:+.1f}% vs {hour}:00 avg ({curr_avg:,.0f}) — "
+            f"within normal range. {trend_str.capitalize()}."
+        )
+
+    return {
+        "signal":     signal,
+        "confidence": confidence,
+        "reasoning":  reasoning,
+        "curr_avg":   curr_avg,
+        "next1_avg":  next1_avg,
+        "next2_avg":  next2_avg,
+    }
+
+
+# ───────────────────────────────────────────────────────────
 # MAIN TICK
 # ───────────────────────────────────────────────────────────
 def run_tick():
@@ -497,6 +626,12 @@ def run_tick():
     except Exception as e:
         log.warning(f"Chart render failed: {e}")
 
+    # ── Signal engine ─────────────────────────────────────────────
+    sig = compute_signal(data, ccu, now_est.hour, is_weekend)
+    SIGNAL_EMOJI = {"LONG": "🟢", "SHORT": "🔴", "HOLD": "🟡", "INSUFFICIENT DATA": "⚪"}
+    sig_emoji    = SIGNAL_EMOJI.get(sig["signal"], "⚪")
+    log.info(f"Signal: {sig['signal']} ({sig['confidence']}) — {sig['reasoning']}")
+
     # ── Notification urgency ─────────────────────────────────────
     if is_new_ath:
         title    = f"🏆 NEW RECORD: {ccu:,}"
@@ -510,6 +645,14 @@ def run_tick():
         title    = f"📉 DROP: {ccu:,}"
         priority = "4"
         tags     = "chart_with_downwards_trend,warning"
+    elif sig["signal"] == "LONG":
+        title    = f"🟢 LONG SIGNAL: {ccu:,}"
+        priority = "4"
+        tags     = "green_circle,moneybag"
+    elif sig["signal"] == "SHORT":
+        title    = f"🔴 SHORT SIGNAL: {ccu:,}"
+        priority = "4"
+        tags     = "red_circle,chart_with_downwards_trend"
     else:
         title    = f"{GAME_NAME} Ticker: {ccu:,}"
         priority = "3"
@@ -520,16 +663,28 @@ def run_tick():
     elif pct_avg < -DROP_AVG_PCT:  trend = "📉 BELOW AVG"
     else:                          trend = "⚖️ Stable"
 
+    # ── Forecast line (next 1-2 hr avgs) ─────────────────────────
+    forecast_parts = []
+    if sig["next1_avg"] is not None:
+        forecast_parts.append(f"{int(sig['next1_avg']):,}")
+    if sig["next2_avg"] is not None:
+        forecast_parts.append(f"{int(sig['next2_avg']):,}")
+    forecast_str = " → ".join(forecast_parts) if forecast_parts else "not enough data"
+
     # ── Notification body ────────────────────────────────────────
-    time_label = now_est.strftime("%-I:%M %p")
+    time_label  = now_est.strftime("%-I:%M %p")
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
     message = (
         f"{trend}\n\n"
         f"15m       {d_15m}\n"
-        f"vs Avg    {d_avg}  _(avg {int(avg_hour):,})_\n"
+        f"vs Avg    {d_avg}  (avg {int(avg_hour):,})\n"
         f"Since ↑   {d_24h}\n\n"
         f"Today   ↑ {state.intraday_high:,}  ↓ {low_display}\n"
-        f"ATH     🏆 {ath:,}"
+        f"ATH     🏆 {ath:,}\n\n"
+        f"── Signal ──────────────────\n"
+        f"{sig_emoji} {sig['signal']}  ({sig['confidence']} confidence)\n"
+        f"{sig['reasoning']}\n"
+        f"Forecast:  {forecast_str}"
     )
 
     send_notification(title, message, priority, tags, chart_png)

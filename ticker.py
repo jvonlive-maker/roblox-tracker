@@ -238,6 +238,16 @@ def diff_label(current: int, historical: int | None) -> tuple[float, str]:
 
 
 # ───────────────────────────────────────────────────────────
+SIGNAL_COLORS = {
+    "LONG":              0x26A69A,
+    "SHORT":             0xEF5350,
+    "HOLD":              0xF4C430,
+    "INSUFFICIENT DATA": 0x888888,
+}
+SIGNAL_EMOJI = {
+    "LONG": "🟢", "SHORT": "🔴", "HOLD": "🟡", "INSUFFICIENT DATA": "⚪"
+}
+
 # SIGNAL ENGINE
 # ───────────────────────────────────────────────────────────
 def _hour_avg(stats: dict, group: str, hour: int) -> tuple[float, int] | None:

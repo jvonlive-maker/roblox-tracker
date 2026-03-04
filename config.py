@@ -30,7 +30,7 @@ GAMES = [
         "redis_key":   "ccu:etfb",
         "ntfy_topic":  "",
         "ath_floor":   3552984,
-        "csv_base":    "eftb",
+        "csv_base":    "etfb",
     },
     
 ]

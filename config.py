@@ -24,6 +24,15 @@ GAMES = [
         "ath_floor":   49793,
         "csv_base":    "uflu",
     },
+    {
+        "name":        "ETFB",
+        "universe_id": "9363735110",
+        "redis_key":   "ccu:etfb",
+        "ntfy_topic":  "",
+        "ath_floor":   3552984,
+        "csv_base":    "eftb",
+    },
+    
 ]
 
 # Shared settings

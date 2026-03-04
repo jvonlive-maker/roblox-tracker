@@ -80,8 +80,14 @@ def record_snapshot(data, game, dow, hour, ccu, now_est):
     # Update dow x hour slot stats incrementally
     key = f"{dow}_{hour}"
     slot = data["slots"].setdefault(key, {"avg": ccu, "std": 0.0, "cv": 0.0, "n": 0, "_vals": []})
-    # Keep raw values list (capped at 30) for live recalculation
-    vals = slot.get("_vals", [])
+    # _vals may be absent in seeded data — reconstruct a plausible list so we
+    # don't reset n to 1 on the first live tick after a seed.
+    vals = slot.get("_vals")
+    if not vals:
+        # Seed stored avg+n but no raw values. Synthesise a list of length n
+        # all equal to avg so existing stats are preserved and new ticks blend in.
+        seed_n = min(slot.get("n", 0), 30)
+        vals   = [round(slot["avg"])] * seed_n if seed_n > 0 else []
     vals.append(ccu)
     vals = vals[-30:]
     slot["_vals"] = vals

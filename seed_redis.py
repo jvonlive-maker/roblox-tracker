@@ -150,12 +150,13 @@ def seed_game(game):
     merged_ath = max(ath, existing.get("ath", 0))
 
     data = {
-        "slots":      slots,          # new: dow_hour keyed slot stats
+        "slots":      slots,
         "trend":      round(trend_blend, 3),
         "last_daily": last_daily,
         "ath":        merged_ath,
         "session":    existing.get("session", {}),
         "ticks":      merged_ticks,
+        "seed_ts":    __import__("datetime").datetime.utcnow().date().isoformat(),
     }
 
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))

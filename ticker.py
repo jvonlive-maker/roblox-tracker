@@ -453,8 +453,6 @@ def run_tick(game):
     persist_state(game, data, now_est)
     save_data(game, data)
 
-    _dbg = data["slots"].get(f"{dow}_{now_est.hour}")
-    log.info(f"[{game['name']}] DEBUG slot {dow}_{now_est.hour}: {_dbg}")
     sig       = compute_signal(data, ccu, dow, now_est.hour)
     sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "

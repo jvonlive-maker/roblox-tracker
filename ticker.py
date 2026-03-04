@@ -1,29 +1,62 @@
-Starting Container
-[11:33:57] INFO: [FF2] Resumed — last CCU: 273
-[11:33:57] INFO: Tracking: FF2  (universe 3150475059)
-[11:33:57] INFO: [UFLU] Resumed — last CCU: 737
-[11:33:57] INFO: Tracking: UFLU  (universe 184199275)
-[11:33:57] INFO: Redis: https://probable-elf-61889.upstash.io...
-[11:33:57] INFO: Discord: enabled
-[11:33:57] INFO: Syncing — next tick in 663s
-  File "/app/ticker.py", line 597, in run_tick
-    peak_str = f"Peak  {pk[0]} {pk[2]:02d}:00  avg {int(pk[1]):,}" if pk else ""
-[11:45:01] ERROR: [UFLU] Unhandled error: Unknown format code 'd' for object of type 'float'
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Traceback (most recent call last):
-    peak_str = f"Peak  {pk[0]} {pk[2]:02d}:00  avg {int(pk[1]):,}" if pk else ""
-  File "/app/ticker.py", line 687, in <module>
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    run_tick(game)
-ValueError: Unknown format code 'd' for object of type 'float'
-[11:45:00] INFO: [FF2] Next tick: 407 (+50 / +14.0%)  Medium  [baseline +60 | momentum +38]
-[11:45:00] ERROR: [FF2] Unhandled error: Unknown format code 'd' for object of type 'float'
-Traceback (most recent call last):
-[11:45:00] INFO: [FF2] Signal: HOLD (Low) cv=51.2% — -0.7% vs adj. avg — avg rises +66.7% → +86.7% over 2h
-  File "/app/ticker.py", line 687, in <module>
-    run_tick(game)
-  File "/app/ticker.py", line 597, in run_tick
-[11:45:01] INFO: [UFLU] Signal: HOLD (Low) cv=49.9% — +8.0% vs adj. avg — avg rises +59.1% → +76.6% over 2h
-[11:45:01] INFO: [UFLU] Next tick: 1,165 (+142 / +13.9%)  Medium  [baseline +140 | momentum +145]
-ValueError: Unknown format code 'd' for object of type 'float'
-[11:45:06] INFO: Syncing — next tick in 894s
+"""
+test_tick.py
+Runs one immediate tick for every game in config.py without
+waiting for the 15-min clock. Sends real Discord notifications
+so you can see exactly what the message looks like.
+
+Usage:
+  UPSTASH_REDIS_REST_URL=x UPSTASH_REDIS_REST_TOKEN=y python3 test_tick.py
+
+Optional flags:
+  --dry-run     skip Discord, just print the message to terminal
+  --game FF2    only test one game
+"""
+
+import sys, os
+sys.path.insert(0, ".")
+
+# ── Parse args ────────────────────────────────────────────
+dry_run    = "--dry-run" in sys.argv
+filter_game = None
+if "--game" in sys.argv:
+    idx = sys.argv.index("--game")
+    if idx + 1 < len(sys.argv):
+        filter_game = sys.argv[idx + 1].upper()
+
+# ── Patch notify to print instead of sending (dry-run) ───
+import ticker
+
+if dry_run:
+    def fake_notify(game, title, message, sig):
+        print(f"\n{'='*55}")
+        print(f"TITLE:   {title}")
+        print(f"SIGNAL:  {sig.get('signal')} ({sig.get('confidence')})")
+        print(f"{'─'*55}")
+        print(message)
+        print(f"{'='*55}\n")
+    ticker.notify = fake_notify
+    print("DRY RUN — Discord notifications suppressed\n")
+
+# ── Run ───────────────────────────────────────────────────
+import config
+
+games = [g for g in config.GAMES
+         if filter_game is None or g["name"].upper() == filter_game]
+
+if not games:
+    print(f"No game matching '{filter_game}' found in config.py")
+    sys.exit(1)
+
+for game in games:
+    print(f"Testing: {game['name']}")
+    data = ticker.load_data(game)
+    ticker.restore_state(game, data)
+    try:
+        ticker.run_tick(game)
+        print(f"  ✓ {game['name']} tick completed")
+    except Exception as e:
+        import traceback
+        print(f"  ✗ {game['name']} FAILED:")
+        traceback.print_exc()
+
+print("\nDone.")

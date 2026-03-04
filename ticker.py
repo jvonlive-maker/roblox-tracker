@@ -1,124 +1,95 @@
 """
 ticker.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Multi-game Roblox CCU ticker.
 - Polls every game in config.GAMES every 15 min
 - Sends alerts to Discord webhook
-- Persists all state in Upstash Redis
+- Persists state in Upstash Redis
 Requires: pip install requests
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import json
-import logging
-import os
-import signal
-import time
+import json, logging, os, signal, time, statistics, math
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 import requests
-
 import config
 
-# ───────────────────────────────────────────────────────────
-# LOGGING
-# ───────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="[%(asctime)s] %(levelname)s: %(message)s",
+                    datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-# ───────────────────────────────────────────────────────────
-# GRACEFUL SHUTDOWN
-# ───────────────────────────────────────────────────────────
 _shutdown = False
-
 def _handle_signal(sig, frame):
     global _shutdown
-    log.info("Shutdown signal received — finishing current tick then exiting.")
+    log.info("Shutdown — finishing current tick.")
     _shutdown = True
-
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# ───────────────────────────────────────────────────────────
-# HTTP SESSION
-# ───────────────────────────────────────────────────────────
-HEADERS = {"User-Agent": "Mozilla/5.0"}
 http = requests.Session()
-http.headers.update(HEADERS)
+http.headers.update({"User-Agent": "Mozilla/5.0"})
 
-# ───────────────────────────────────────────────────────────
-# UPSTASH REDIS
-# ───────────────────────────────────────────────────────────
 REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL",   "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
+def _rh(): return {"Authorization": f"Bearer {REDIS_TOKEN}"}
 
-def _redis_headers():
-    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
-
-
-def redis_get(key: str) -> str | None:
-    url    = f"{REDIS_URL}/get/{quote(key, safe='')}"
-    r      = http.get(url, headers=_redis_headers(), timeout=10)
+def redis_get(key):
+    r = http.get(f"{REDIS_URL}/get/{quote(key,safe='')}", headers=_rh(), timeout=10)
     r.raise_for_status()
-    result = r.json().get("result")
-    return result if isinstance(result, str) else None
+    v = r.json().get("result")
+    return v if isinstance(v, str) else None
 
-
-def redis_set(key: str, value: str, retries: int = 3):
-    url = f"{REDIS_URL}/set/{quote(key, safe='')}/{quote(value, safe='')}"
-    for attempt in range(1, retries + 1):
+def redis_set(key, value, retries=3):
+    url = f"{REDIS_URL}/set/{quote(key,safe='')}/{quote(value,safe='')}"
+    for attempt in range(1, retries+1):
         try:
-            r = http.get(url, headers=_redis_headers(), timeout=10)
-            r.raise_for_status()
+            http.get(url, headers=_rh(), timeout=10).raise_for_status()
             return
         except requests.RequestException as e:
-            wait = 2 ** attempt
-            log.warning(f"Redis SET failed (attempt {attempt}/{retries}): {e}. Retry in {wait}s")
+            wait = 2**attempt
+            log.warning(f"Redis SET failed ({attempt}/{retries}): {e}. Retry in {wait}s")
             time.sleep(wait)
     log.error("All Redis SET attempts failed.")
 
+# ── Data ─────────────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# DATA  —  load / save / snapshot
-# ───────────────────────────────────────────────────────────
-def load_data(game: dict) -> dict:
+def load_data(game):
     try:
         raw = redis_get(game["redis_key"])
         if raw:
             data = json.loads(raw)
-            data.setdefault("ath",     game["ath_floor"])
+            data.setdefault("ath",        game["ath_floor"])
             data["ath"] = max(data["ath"], game["ath_floor"])
-            data.setdefault("stats",   {"weekday": {}, "weekend": {}})
-            data.setdefault("session", {})
-            data.setdefault("ticks",   [])
+            data.setdefault("slots",      {})
+            data.setdefault("trend",      0.0)
+            data.setdefault("last_daily", None)
+            data.setdefault("session",    {})
+            data.setdefault("ticks",      [])
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
-    return {
-        "stats":   {"weekday": {}, "weekend": {}},
-        "ath":     game["ath_floor"],
-        "session": {},
-        "ticks":   [],
-    }
+    return {"slots": {}, "trend": 0.0, "last_daily": None,
+            "ath": game["ath_floor"], "session": {}, "ticks": []}
 
-
-def save_data(game: dict, data: dict):
+def save_data(game, data):
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))
 
-
-def record_snapshot(data: dict, game: dict, is_weekend: bool, hour: int,
-                    ccu: int, now_est: datetime) -> tuple[float, int, bool]:
-    group    = "weekend" if is_weekend else "weekday"
-    hour_key = str(hour)
-    slot     = data["stats"][group].setdefault(hour_key, [])
-    slot.append(ccu)
-    data["stats"][group][hour_key] = slot[-30:]
+def record_snapshot(data, game, dow, hour, ccu, now_est):
+    # Update dow x hour slot stats incrementally
+    key = f"{dow}_{hour}"
+    slot = data["slots"].setdefault(key, {"avg": ccu, "std": 0.0, "cv": 0.0, "n": 0, "_vals": []})
+    # Keep raw values list (capped at 30) for live recalculation
+    vals = slot.get("_vals", [])
+    vals.append(ccu)
+    vals = vals[-30:]
+    slot["_vals"] = vals
+    slot["n"]     = len(vals)
+    slot["avg"]   = sum(vals) / len(vals)
+    slot["std"]   = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    slot["cv"]    = (slot["std"] / slot["avg"] * 100) if slot["avg"] > 0 else 0.0
+    data["slots"][key] = slot
 
     is_new_ath = ccu > data["ath"]
     if is_new_ath:
@@ -127,47 +98,37 @@ def record_snapshot(data: dict, game: dict, is_weekend: bool, hour: int,
     tick_ts = now_est.strftime("%Y-%m-%dT%H:%M")
     if not data["ticks"] or data["ticks"][-1]["ts"] != tick_ts:
         data["ticks"].append({"ts": tick_ts, "ccu": ccu})
-        data["ticks"] = data["ticks"][-120:]
+        data["ticks"] = data["ticks"][-2016:]
 
-    avg = sum(data["stats"][group][hour_key]) / len(data["stats"][group][hour_key])
-    return avg, data["ath"], is_new_ath
+    return data["slots"][key]["avg"], data["ath"], is_new_ath
 
+# ── Session state ─────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# PER-GAME SESSION STATE
-# ───────────────────────────────────────────────────────────
 class GameState:
     def __init__(self):
-        self.last_tick:      int | None = None
-        self.midnight_ccu:   int | None = None
-        self.last_date:      object     = None
-        self.intraday_high:  int        = 0
-        self.intraday_low:   int | None = None
-        self.intraday_sum:   int        = 0
-        self.intraday_ticks: int        = 0
+        self.last_tick      = None
+        self.midnight_ccu   = None
+        self.last_date      = None
+        self.intraday_high  = 0
+        self.intraday_low   = None
+        self.intraday_sum   = 0
+        self.intraday_ticks = 0
 
+_game_states = {}
+def get_state(game):
+    k = game["redis_key"]
+    if k not in _game_states:
+        _game_states[k] = GameState()
+    return _game_states[k]
 
-# One GameState per game, keyed by redis_key
-_game_states: dict[str, GameState] = {}
-
-def get_state(game: dict) -> GameState:
-    key = game["redis_key"]
-    if key not in _game_states:
-        _game_states[key] = GameState()
-    return _game_states[key]
-
-
-def restore_state(game: dict, data: dict):
-    state     = get_state(game)
-    s         = data.get("session", {})
+def restore_state(game, data):
+    state = get_state(game)
+    s     = data.get("session", {})
     state.last_tick    = s.get("last_tick")
     state.midnight_ccu = s.get("midnight_ccu")
-
     now_est   = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     today_str = now_est.date().isoformat()
-    saved     = s.get("last_date")
-
-    if saved == today_str:
+    if s.get("last_date") == today_str:
         state.last_date      = now_est.date()
         state.intraday_high  = s.get("intraday_high", 0)
         raw_low              = s.get("intraday_low")
@@ -175,12 +136,11 @@ def restore_state(game: dict, data: dict):
         state.intraday_sum   = s.get("intraday_sum",   0)
         state.intraday_ticks = s.get("intraday_ticks", 0)
         prev = f"{state.last_tick:,}" if state.last_tick else "none"
-        log.info(f"[{game['name']}] Resumed from {saved} — last CCU: {prev}")
+        log.info(f"[{game['name']}] Resumed — last CCU: {prev}")
     else:
-        log.info(f"[{game['name']}] New day — intraday state reset")
+        log.info(f"[{game['name']}] New day — intraday reset")
 
-
-def persist_state(game: dict, data: dict, now_est: datetime):
+def persist_state(game, data, now_est):
     state = get_state(game)
     data["session"] = {
         "last_tick":      state.last_tick,
@@ -192,43 +152,9 @@ def persist_state(game: dict, data: dict, now_est: datetime):
         "intraday_ticks": state.intraday_ticks,
     }
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# CANDLESTICK CHART
-# ───────────────────────────────────────────────────────────
-BG      = "#131722"
-PANEL   = "#1E222D"
-GRID    = "#2A2E39"
-TEXT    = "#D1D4DC"
-GREEN   = "#26A69A"
-RED     = "#EF5350"
-AVGLINE = "#F4C430"
-
-
-def build_candles(ticks: list[dict]) -> list[dict]:
-    needed  = ticks[-(config.CANDLES * config.TICKS_PER_CANDLE):]
-    candles = []
-    for i in range(0, len(needed), config.TICKS_PER_CANDLE):
-        chunk = needed[i:i + config.TICKS_PER_CANDLE]
-        if not chunk:
-            continue
-        values = [t["ccu"] for t in chunk]
-        candles.append({
-            "label": chunk[0]["ts"][11:16],
-            "open":  values[0],
-            "close": values[-1],
-            "high":  max(values),
-            "low":   min(values),
-        })
-    return candles[-config.CANDLES:]
-
-
-
-
-# ───────────────────────────────────────────────────────────
-# FORMATTING
-# ───────────────────────────────────────────────────────────
-def diff_label(current: int, historical: int | None) -> tuple[float, str]:
+def diff_label(current, historical):
     if historical is None or historical == 0:
         return 0.0, "—"
     diff = current - historical
@@ -236,279 +162,261 @@ def diff_label(current: int, historical: int | None) -> tuple[float, str]:
     sign = "+" if diff >= 0 else ""
     return pct, f"{sign}{diff:,} ({sign}{pct:.1f}%)"
 
+def get_slot(data, dow, hour):
+    return data["slots"].get(f"{dow}_{hour % 24}")
 
-# ───────────────────────────────────────────────────────────
+# ── Signal engine ─────────────────────────────────────────────────────────────
+
 SIGNAL_COLORS = {
-    "LONG":              0x26A69A,
-    "SHORT":             0xEF5350,
-    "HOLD":              0xF4C430,
-    "INSUFFICIENT DATA": 0x888888,
+    "LONG": 0x26A69A, "SHORT": 0xEF5350,
+    "HOLD": 0xF4C430, "INSUFFICIENT DATA": 0x888888,
 }
 SIGNAL_EMOJI = {
     "LONG": "🟢", "SHORT": "🔴", "HOLD": "🟡", "INSUFFICIENT DATA": "⚪"
 }
 
-# SIGNAL ENGINE
-# ───────────────────────────────────────────────────────────
-def _hour_avg(stats: dict, group: str, hour: int) -> tuple[float, int] | None:
-    slot = stats[group].get(str(hour % 24), [])
-    if len(slot) < config.SIGNAL_MIN_SAMPLES:
-        return None
-    return sum(slot) / len(slot), len(slot)
+def trend_adjusted_avg(slot, trend_per_day, last_daily_ccu, current_ccu):
+    """
+    Adjust the historical slot average for the observed decline trend.
+    We anchor to last known daily CCU and apply the trend to estimate
+    what the 'true' current baseline is.
+    """
+    if slot is None or last_daily_ccu is None or last_daily_ccu == 0:
+        return slot["avg"] if slot else None
+    # Ratio of current reality vs last daily snapshot
+    ratio = current_ccu / last_daily_ccu
+    # Blend: 50% raw historical avg, 50% trend-adjusted
+    raw_avg     = slot["avg"]
+    trend_adj   = raw_avg * ratio
+    return raw_avg * 0.5 + trend_adj * 0.5
 
+def compute_signal(data, ccu, dow, hour):
+    curr_slot = get_slot(data, dow, hour)
+    next_slot = get_slot(data, dow, hour + 1)
+    next2_slot= get_slot(data, dow, hour + 2)
 
-def compute_signal(data: dict, ccu: int, hour: int, is_weekend: bool) -> dict:
-    group = "weekend" if is_weekend else "weekday"
-    stats = data["stats"]
-
-    curr  = _hour_avg(stats, group, hour)
-    next1 = _hour_avg(stats, group, hour + 1)
-    next2 = _hour_avg(stats, group, hour + 2)
-
-    if curr is None:
+    if curr_slot is None or curr_slot["n"] < config.SIGNAL_MIN_SAMPLES:
         return {
             "signal": "INSUFFICIENT DATA", "confidence": "—",
-            "reasoning": f"Need {config.SIGNAL_MIN_SAMPLES}+ samples for hour {hour}.",
-            "curr_avg": None, "next1_avg": None, "next2_avg": None,
+            "reasoning": f"Need {config.SIGNAL_MIN_SAMPLES}+ samples for this slot.",
+            "curr_avg": None, "next1_avg": None, "next2_avg": None, "cv": None,
         }
 
-    curr_avg, curr_n = curr
-    next1_avg = next1[0] if next1 else None
-    next2_avg = next2[0] if next2 else None
+    curr_avg  = trend_adjusted_avg(curr_slot, data["trend"], data["last_daily"], ccu)
+    next1_avg = trend_adjusted_avg(next_slot,  data["trend"], data["last_daily"], ccu) if next_slot else None
+    next2_avg = trend_adjusted_avg(next2_slot, data["trend"], data["last_daily"], ccu) if next2_slot else None
+    cv        = curr_slot["cv"]
     pct       = (ccu - curr_avg) / curr_avg * 100
 
-    trend_up = trend_down = False
-    trend_str = "unknown next-hour trend"
+    # Confidence from CV: lower volatility = more confident
+    if   cv < 12:  confidence = "High"
+    elif cv < 22:  confidence = "Medium"
+    else:          confidence = "Low"
 
+    # Trend direction
+    trend_up = trend_down = False
+    trend_str = "trend unclear"
     if next1_avg is not None:
         d1 = (next1_avg - curr_avg) / curr_avg * 100
         if next2_avg is not None:
             d2 = (next2_avg - curr_avg) / curr_avg * 100
             if d1 > config.SIGNAL_TREND_PCT and d2 > config.SIGNAL_TREND_PCT:
-                trend_up  = True
-                trend_str = f"avg rises +{d1:.1f}% then +{d2:.1f}% over 2h"
+                trend_up  = True; trend_str = f"avg rises +{d1:.1f}% → +{d2:.1f}% over 2h"
             elif d1 < -config.SIGNAL_TREND_PCT and d2 < -config.SIGNAL_TREND_PCT:
-                trend_down = True
-                trend_str  = f"avg falls {d1:.1f}% then {d2:.1f}% over 2h"
+                trend_down= True; trend_str = f"avg falls {d1:.1f}% → {d2:.1f}% over 2h"
             else:
                 trend_str = f"mixed next 2h ({d1:+.1f}%, {d2:+.1f}%)"
         else:
-            if d1 > config.SIGNAL_TREND_PCT:
-                trend_up  = True
-                trend_str = f"avg rises +{d1:.1f}% next hour"
-            elif d1 < -config.SIGNAL_TREND_PCT:
-                trend_down = True
-                trend_str  = f"avg falls {d1:.1f}% next hour"
-            else:
-                trend_str = f"flat next hour ({d1:+.1f}%)"
-
-    score = min(curr_n, 20) + (3 if next1 else 0) + (3 if next2 else 0)
-    confidence = "High" if score >= 18 else "Medium" if score >= 10 else "Low"
+            if   d1 >  config.SIGNAL_TREND_PCT: trend_up   = True; trend_str = f"avg rises +{d1:.1f}% next hr"
+            elif d1 < -config.SIGNAL_TREND_PCT: trend_down  = True; trend_str = f"avg falls {d1:.1f}% next hr"
+            else: trend_str = f"flat next hr ({d1:+.1f}%)"
 
     if pct < -config.SIGNAL_LONG_PCT and trend_up:
         signal    = "LONG"
-        reasoning = f"{pct:.1f}% below avg — {trend_str} — expect recovery"
+        reasoning = f"{pct:.1f}% below adj. avg — {trend_str} — recovery expected"
     elif pct > config.SIGNAL_SHORT_PCT and trend_down:
         signal    = "SHORT"
-        reasoning = f"+{pct:.1f}% above avg — {trend_str} — expect pullback"
+        reasoning = f"+{pct:.1f}% above adj. avg — {trend_str} — pullback expected"
     elif pct < -config.SIGNAL_LONG_PCT:
-        signal    = "HOLD"
-        reasoning = f"{pct:.1f}% below avg but {trend_str}"
+        signal    = "HOLD"; reasoning = f"{pct:.1f}% below avg but {trend_str}"
     elif pct > config.SIGNAL_SHORT_PCT:
-        signal    = "HOLD"
-        reasoning = f"+{pct:.1f}% above avg but {trend_str}"
+        signal    = "HOLD"; reasoning = f"+{pct:.1f}% above avg but {trend_str}"
     else:
-        signal    = "HOLD"
-        reasoning = f"{pct:+.1f}% vs avg — {trend_str}"
+        signal    = "HOLD"; reasoning = f"{pct:+.1f}% vs adj. avg — {trend_str}"
 
     return {
         "signal": signal, "confidence": confidence, "reasoning": reasoning,
-        "curr_avg": curr_avg, "next1_avg": next1_avg, "next2_avg": next2_avg,
+        "curr_avg": curr_avg, "next1_avg": next1_avg, "next2_avg": next2_avg, "cv": cv,
     }
 
+# ── Next-tick predictor ───────────────────────────────────────────────────────
 
-
-# ───────────────────────────────────────────────────────────
-# NEXT-TICK PREDICTOR
-# ───────────────────────────────────────────────────────────
-def predict_next_tick(data: dict, ccu: int, now_est, is_weekend: bool) -> dict:
+def predict_next_tick(data, ccu, now_est, dow):
     """
-    Predicts the CCU change for the NEXT 15-min tick using two signals:
-
-    1. Momentum  — average change between consecutive ticks over recent history
-                   at the same weekday + hour + 15-min slot
-    2. Hour drift — difference between current hour avg and next hour avg,
-                    prorated to 15 minutes (1/4 of the hourly move)
-
-    Returns:
-        predicted_ccu   int
-        delta           int   (predicted_ccu - ccu)
-        delta_pct       float
-        confidence      str   Low / Medium / High
-        basis           str   human-readable explanation
+    Three-signal predictor:
+    1. Trend-adjusted dow x hour baseline delta (curr → next hour slot, prorated to 15 min)
+    2. Recent momentum from last 3 ticks
+    3. Intra-hour position bias from 10-min shape data
     """
-    group    = "weekend" if is_weekend else "weekday"
-    hour     = now_est.hour
-    minute   = now_est.minute   # 0, 15, 30, or 45
-    ticks    = data.get("ticks", [])
+    hour   = now_est.hour
+    minute = now_est.minute
+    ticks  = data.get("ticks", [])
 
-    # ── Signal 1: same-slot momentum ──────────────────────────
-    # Find historical ticks that landed on the same weekday + hour + minute
-    # and compute the average move to the *following* tick
-    from datetime import datetime
-    slot_deltas = []
+    # ── Signal 1: baseline drift ──────────────────────────────
+    curr_slot = get_slot(data, dow, hour)
+    next_slot = get_slot(data, dow, hour + 1)
+    baseline_delta = None
+    baseline_cv    = None
+    if curr_slot and next_slot and curr_slot["n"] >= config.SIGNAL_MIN_SAMPLES:
+        curr_adj = trend_adjusted_avg(curr_slot, data["trend"], data["last_daily"], ccu)
+        next_adj = trend_adjusted_avg(next_slot, data["trend"], data["last_daily"], ccu)
+        # Prorate: we're `minute` mins into the hour, so fraction remaining = (60-minute)/60
+        # The next tick fires in 15 min. Drift for 15 min = hourly_drift × (15/60)
+        hourly_drift   = next_adj - curr_adj
+        baseline_delta = hourly_drift * (15 / 60)
+        baseline_cv    = curr_slot["cv"]
+
+    # ── Signal 2: recent momentum (last 3 ticks) ──────────────
+    momentum_delta = None
+    if len(ticks) >= 3:
+        recent = ticks[-3:]
+        # Average of tick-to-tick deltas
+        deltas = [recent[i+1]["ccu"] - recent[i]["ccu"] for i in range(len(recent)-1)]
+        # Weight more recent delta heavier
+        weights = [0.4, 0.6]
+        momentum_delta = sum(d*w for d,w in zip(deltas, weights))
+
+    # ── Signal 3: same dow+hour+minute historical momentum ─────
+    slot_delta = None
+    slot_deltas_list = []
     for i in range(len(ticks) - 1):
         try:
             t0 = datetime.strptime(ticks[i]["ts"],   "%Y-%m-%dT%H:%M")
             t1 = datetime.strptime(ticks[i+1]["ts"], "%Y-%m-%dT%H:%M")
         except ValueError:
             continue
-        # Match weekday, hour, and 15-min slot
-        if (t0.weekday() >= 5) == is_weekend and t0.hour == hour and t0.minute == minute:
-            # Only use if the next tick is actually 15 min later (not a gap)
-            if (t1 - t0).seconds == 900:
-                slot_deltas.append(ticks[i+1]["ccu"] - ticks[i]["ccu"])
+        diff_mins = (t1 - t0).seconds // 60
+        if (t0.weekday() == dow and t0.hour == hour
+                and t0.minute == minute and diff_mins in (10, 15)):
+            slot_deltas_list.append(ticks[i+1]["ccu"] - ticks[i]["ccu"])
+    if slot_deltas_list:
+        slot_delta = sum(slot_deltas_list) / len(slot_deltas_list)
 
-    # ── Signal 2: hour-boundary drift ─────────────────────────
-    # How much does the hourly avg change next hour, prorated to 15 min?
-    stats     = data["stats"]
-    curr_slot = stats[group].get(str(hour), [])
-    next_slot = stats[group].get(str((hour + 1) % 24), [])
-    hour_drift_15 = None
-    if len(curr_slot) >= config.SIGNAL_MIN_SAMPLES and len(next_slot) >= config.SIGNAL_MIN_SAMPLES:
-        curr_avg   = sum(curr_slot) / len(curr_slot)
-        next_avg   = sum(next_slot) / len(next_slot)
-        # Full hourly drift prorated to 15 min (one tick = 1/4 of the hour)
-        hour_drift_15 = (next_avg - curr_avg) / 4
+    # ── Combine ───────────────────────────────────────────────
+    signals = []
+    weights = []
 
-    # ── Combine signals ────────────────────────────────────────
-    if slot_deltas and hour_drift_15 is not None:
-        # Blend: 60% momentum, 40% hour drift
-        momentum   = sum(slot_deltas) / len(slot_deltas)
-        delta      = momentum * 0.6 + hour_drift_15 * 0.4
-        n_samples  = len(slot_deltas)
-        confidence = "High" if n_samples >= 8 else "Medium" if n_samples >= 3 else "Low"
-        basis      = f"{n_samples} same-slot samples + hour drift {hour_drift_15:+.0f}"
-    elif slot_deltas:
-        delta      = sum(slot_deltas) / len(slot_deltas)
-        n_samples  = len(slot_deltas)
-        confidence = "Medium" if n_samples >= 3 else "Low"
-        basis      = f"{n_samples} same-slot samples (no hour drift data)"
-    elif hour_drift_15 is not None:
-        delta      = hour_drift_15
-        confidence = "Low"
-        basis      = "hour drift only (no same-slot history)"
+    if baseline_delta is not None:
+        signals.append(baseline_delta)
+        # Weight inversely to CV — low volatility slot gets more weight
+        w = max(0.1, 1.0 - baseline_cv / 100)
+        weights.append(w * 1.5)   # baseline gets 1.5× base weight
+
+    if slot_delta is not None:
+        signals.append(slot_delta)
+        # More historical same-slot samples = more weight
+        w = min(1.0, len(slot_deltas_list) / 8)
+        weights.append(w * 1.2)
+
+    if momentum_delta is not None:
+        signals.append(momentum_delta)
+        weights.append(0.6)       # momentum gets moderate weight
+
+    if not signals:
+        return {"predicted_ccu": None, "delta": None, "delta_pct": None,
+                "confidence": "—", "detail": "insufficient data"}
+
+    total_w   = sum(weights)
+    delta     = sum(s * w for s, w in zip(signals, weights)) / total_w
+    predicted = round(ccu + delta)
+    delta_int = predicted - ccu
+    delta_pct = delta / ccu * 100 if ccu else 0
+
+    # Confidence: based on how many signals fired + slot CV
+    n_signals = len(signals)
+    if n_signals == 3 and baseline_cv is not None and baseline_cv < 15:
+        confidence = "High"
+    elif n_signals >= 2:
+        confidence = "Medium"
     else:
-        return {
-            "predicted_ccu": None, "delta": None, "delta_pct": None,
-            "confidence": "—", "basis": "insufficient data"
-        }
+        confidence = "Low"
 
-    predicted_ccu = round(ccu + delta)
-    delta_int     = predicted_ccu - ccu
-    delta_pct     = delta / ccu * 100 if ccu else 0
+    parts = []
+    if baseline_delta is not None: parts.append(f"baseline {baseline_delta:+.0f}")
+    if slot_delta     is not None: parts.append(f"slot {slot_delta:+.0f} (n={len(slot_deltas_list)})")
+    if momentum_delta is not None: parts.append(f"momentum {momentum_delta:+.0f}")
 
     return {
-        "predicted_ccu": predicted_ccu,
+        "predicted_ccu": predicted,
         "delta":         delta_int,
         "delta_pct":     delta_pct,
         "confidence":    confidence,
-        "basis":         basis,
+        "detail":        " | ".join(parts),
     }
 
-# ───────────────────────────────────────────────────────────
-# NTFY
-# ───────────────────────────────────────────────────────────
+# ── Discord ───────────────────────────────────────────────────────────────────
 
-def send_discord(game: dict, title: str, message: str,
-                 sig: dict, retries: int = 3):
+def send_discord(game, title, message, sig, retries=3):
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
-
-    color = SIGNAL_COLORS.get(sig["signal"], 0x888888)
-
-    # Build a clean Discord embed
-    embed = {
-        "title":       title,
-        "description": message,
-        "color":       color,
-        "footer":      {"text": f"{game['name']}  •  EST"},
-    }
-
-    payload = json.dumps({"embeds": [embed]})
-
-    for attempt in range(1, retries + 1):
+    color   = SIGNAL_COLORS.get(sig["signal"], 0x888888)
+    payload = json.dumps({"embeds": [{"title": title, "description": message,
+                                      "color": color,
+                                      "footer": {"text": f"{game['name']}  •  EST"}}]})
+    for attempt in range(1, retries+1):
         try:
             r = http.post(webhook, data=payload,
                           headers={"Content-Type": "application/json"}, timeout=10)
-            # 204 = success, 429 = rate limited
             if r.status_code == 429:
-                retry_after = r.json().get("retry_after", 2)
-                log.warning(f"[{game['name']}] Discord rate limited — waiting {retry_after}s")
-                time.sleep(retry_after)
-                continue
-            r.raise_for_status()
-            break
+                time.sleep(r.json().get("retry_after", 2)); continue
+            r.raise_for_status(); return
         except requests.RequestException as e:
             if attempt == retries:
-                log.error(f"[{game['name']}] Discord send failed: {e}")
-                return
-            time.sleep(2 ** attempt)
+                log.error(f"[{game['name']}] Discord failed: {e}"); return
+            time.sleep(2**attempt)
 
-
-
-# ───────────────────────────────────────────────────────────
-# COMBINED NOTIFY  —  sends to both ntfy + Discord
-# ───────────────────────────────────────────────────────────
-def notify(game: dict, title: str, message: str, sig: dict):
+def notify(game, title, message, sig):
     send_discord(game, title, message, sig)
 
+# ── Roblox API ────────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# ROBLOX API
-# ───────────────────────────────────────────────────────────
-def fetch_ccu(game: dict, retries: int = 3) -> int | None:
+def fetch_ccu(game, retries=3):
     url = f"https://games.roblox.com/v1/games?universeIds={game['universe_id']}"
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, retries+1):
         try:
             r = http.get(url, timeout=10)
             r.raise_for_status()
             return r.json()["data"][0]["playing"]
         except (requests.RequestException, KeyError, IndexError) as e:
             if attempt == retries:
-                log.error(f"[{game['name']}] Roblox API failed: {e}")
-                return None
-            time.sleep(2 ** attempt)
+                log.error(f"[{game['name']}] Roblox API failed: {e}"); return None
+            time.sleep(2**attempt)
     return None
 
+# ── Daily summary ─────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# DAILY SUMMARY
-# ───────────────────────────────────────────────────────────
-def send_daily_summary(game: dict):
+def send_daily_summary(game):
     state = get_state(game)
-    if state.intraday_ticks == 0:
-        return
+    if state.intraday_ticks == 0: return
     avg  = state.intraday_sum // state.intraday_ticks
-    high = state.intraday_high
     low  = state.intraday_low or 0
-    title   = f"📅 {game['name']} — Daily Summary"
-    message = f"↑ {high:,}  ↓ {low:,}  avg {avg:,}"
-    notify(game, title, message, {"signal": "HOLD", "confidence": "—", "reasoning": ""})
-    log.info(f"[{game['name']}] Daily summary — high={high:,} low={low:,} avg={avg:,}")
+    msg  = f"↑ {state.intraday_high:,}  ↓ {low:,}  avg {avg:,}"
+    notify(game, f"📅 {game['name']} — Daily Summary", msg,
+           {"signal": "HOLD"})
+    log.info(f"[{game['name']}] Daily summary — "
+             f"high={state.intraday_high:,} low={low:,} avg={avg:,}")
 
+# ── Main tick ─────────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# TICK  —  runs once per game per 15-min mark
-# ───────────────────────────────────────────────────────────
-def run_tick(game: dict):
-    now_est    = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
-    is_weekend = now_est.weekday() >= 5
-    today      = now_est.date()
-    state      = get_state(game)
+DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
 
-    # Day rollover
+def run_tick(game):
+    now_est = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
+    dow     = now_est.weekday()
+    today   = now_est.date()
+    state   = get_state(game)
+
     if state.last_date != today:
         if state.last_date is not None:
             send_daily_summary(game)
@@ -519,11 +427,10 @@ def run_tick(game: dict):
         state.last_date      = today
 
     ccu = fetch_ccu(game)
-    if ccu is None:
-        return
+    if ccu is None: return
 
     data = load_data(game)
-    avg_hour, ath, is_new_ath = record_snapshot(data, game, is_weekend, now_est.hour, ccu, now_est)
+    avg_hour, ath, is_new_ath = record_snapshot(data, game, dow, now_est.hour, ccu, now_est)
 
     if state.midnight_ccu is None:
         state.midnight_ccu = ccu
@@ -534,68 +441,63 @@ def run_tick(game: dict):
     state.intraday_ticks += 1
 
     pct_15m, d_15m = diff_label(ccu, state.last_tick)
-    pct_avg, d_avg = diff_label(ccu, int(avg_hour))
+    pct_avg, d_avg = diff_label(ccu, round(avg_hour))
     _,       d_24h = diff_label(ccu, state.midnight_ccu)
 
     persist_state(game, data, now_est)
     save_data(game, data)
 
-
-
-    sig       = compute_signal(data, ccu, now_est.hour, is_weekend)
+    sig       = compute_signal(data, ccu, dow, now_est.hour)
     sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
-    log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) — {sig['reasoning']}")
+    log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "
+             f"cv={sig.get('cv','?'):.1f}% — {sig['reasoning']}" if sig.get('cv') else
+             f"[{game['name']}] Signal: {sig['signal']} — {sig['reasoning']}")
 
-    pred = predict_next_tick(data, ccu, now_est, is_weekend)
+    pred = predict_next_tick(data, ccu, now_est, dow)
     if pred["predicted_ccu"] is not None:
-        sign = "+" if pred["delta"] >= 0 else ""
-        pred_str = f"{pred['predicted_ccu']:,} ({sign}{pred['delta']:,} / {sign}{pred['delta_pct']:.1f}%) • {pred['confidence']}"
-        log.info(f"[{game['name']}] Next tick prediction: {pred_str}")
+        sign     = "+" if pred["delta"] >= 0 else ""
+        pred_str = (f"{pred['predicted_ccu']:,} ({sign}{pred['delta']:,} / "
+                    f"{sign}{pred['delta_pct']:.1f}%)  {pred['confidence']}")
+        log.info(f"[{game['name']}] Next tick: {pred_str}  [{pred['detail']}]")
     else:
         pred_str = "—"
 
-    # Forecast (hourly)
+    # Hourly forecast
     forecast_parts = []
-    if sig["next1_avg"] is not None:
-        forecast_parts.append(f"{int(sig['next1_avg']):,}")
-    if sig["next2_avg"] is not None:
-        forecast_parts.append(f"{int(sig['next2_avg']):,}")
+    if sig["next1_avg"]: forecast_parts.append(f"{int(sig['next1_avg']):,}")
+    if sig["next2_avg"]: forecast_parts.append(f"{int(sig['next2_avg']):,}")
     forecast_str = " → ".join(forecast_parts) if forecast_parts else "—"
 
-    # Title + priority
+    # Title
     if is_new_ath:
-        title    = f"🏆 {game['name']} NEW RECORD: {ccu:,}"
-        priority = "5"; tags = "tada,fire"
+        title = f"🏆 {game['name']} NEW RECORD: {ccu:,}"; priority="5"; tags="tada,fire"
     elif state.last_tick is not None and pct_15m > config.VOLATILITY_PCT:
-        title    = f"📈 {game['name']} SPIKE: {ccu:,}"
-        priority = "4"; tags = "chart_with_upwards_trend,warning"
+        title = f"📈 {game['name']} SPIKE: {ccu:,}"; priority="4"; tags="warning"
     elif state.last_tick is not None and pct_15m < -config.VOLATILITY_PCT:
-        title    = f"📉 {game['name']} DROP: {ccu:,}"
-        priority = "4"; tags = "chart_with_downwards_trend,warning"
+        title = f"📉 {game['name']} DROP: {ccu:,}"; priority="4"; tags="warning"
     elif sig["signal"] == "LONG":
-        title    = f"🟢 {game['name']} LONG: {ccu:,}"
-        priority = "4"; tags = "green_circle,moneybag"
+        title = f"🟢 {game['name']} LONG: {ccu:,}"; priority="4"; tags="moneybag"
     elif sig["signal"] == "SHORT":
-        title    = f"🔴 {game['name']} SHORT: {ccu:,}"
-        priority = "4"; tags = "red_circle,chart_with_downwards_trend"
+        title = f"🔴 {game['name']} SHORT: {ccu:,}"; priority="4"; tags="chart_with_downwards_trend"
     else:
-        title    = f"{game['name']} Ticker: {ccu:,}"
-        priority = "3"; tags = "football"
+        title = f"{game['name']} • {DAYS[dow]} {now_est.strftime('%-I:%M %p')}  {ccu:,}"
+        priority="3"; tags="football"
 
-    # Trend
-    if   pct_avg >  config.BREAKOUT_PCT:  trend = "🔥 BREAKOUT"
-    elif pct_avg < -config.DROP_AVG_PCT:  trend = "📉 BELOW AVG"
-    else:                                 trend = "⚖️ Stable"
+    # Trend label
+    if   pct_avg >  config.BREAKOUT_PCT: trend = "🔥 BREAKOUT"
+    elif pct_avg < -config.DROP_AVG_PCT: trend = "📉 BELOW AVG"
+    else:                                trend = "⚖️ Stable"
 
-    # Signal summary lines (short, mobile-friendly)
     time_label  = now_est.strftime("%-I:%M %p")
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
-    pct_str     = f"{(ccu - sig['curr_avg']) / sig['curr_avg'] * 100:+.1f}%" if sig["curr_avg"] else ""
-    sig_line1   = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']} confidence"
-    sig_line2   = f"CCU {pct_str} vs avg  •  1h: {forecast_str}"
+    pct_str     = f"{(ccu-sig['curr_avg'])/sig['curr_avg']*100:+.1f}%" if sig["curr_avg"] else ""
+    cv_str      = f"  cv {sig['cv']:.0f}%" if sig.get("cv") is not None else ""
+
+    sig_line1 = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']}{cv_str}"
+    sig_line2 = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
 
     message = (
-        f"{trend}  •  {time_label}\n"
+        f"{trend}  •  {DAYS[dow]} {time_label}\n"
         f"\n"
         f"CCU      {ccu:,}\n"
         f"15m      {d_15m}\n"
@@ -610,30 +512,23 @@ def run_tick(game: dict):
     )
 
     notify(game, title, message, sig)
-
     state.last_tick = ccu
-    log.info(f"[{game['name']}] Tick @ {time_label} — CCU: {ccu:,} | Avg: {int(avg_hour):,} | ATH: {ath:,}")
+    log.info(f"[{game['name']}] Tick @ {time_label} — "
+             f"CCU: {ccu:,} | Avg: {round(avg_hour):,} | ATH: {ath:,}")
 
+# ── Loop ──────────────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────
-# CLOCK-SYNCED LOOP
-# ───────────────────────────────────────────────────────────
-def seconds_until_next_quarter() -> int:
+def seconds_until_next_quarter():
     now     = datetime.now()
     elapsed = (now.minute % 15) * 60 + now.second
     return 900 - elapsed
 
-
 if __name__ == "__main__":
     if not REDIS_URL or not REDIS_TOKEN:
-        log.error("Missing UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN env vars")
-        raise SystemExit(1)
-
+        log.error("Missing Redis env vars"); raise SystemExit(1)
     if not config.GAMES:
-        log.error("No games configured in config.py")
-        raise SystemExit(1)
+        log.error("No games in config.py"); raise SystemExit(1)
 
-    # Restore state for all games
     for game in config.GAMES:
         restore_state(game, load_data(game))
         log.info(f"Tracking: {game['name']}  (universe {game['universe_id']})")
@@ -645,16 +540,14 @@ if __name__ == "__main__":
         wait = seconds_until_next_quarter()
         log.info(f"Syncing — next tick in {wait}s")
         for _ in range(wait):
-            if _shutdown:
-                break
+            if _shutdown: break
             time.sleep(1)
-
         if not _shutdown:
             for game in config.GAMES:
                 try:
                     run_tick(game)
                 except Exception as e:
-                    log.error(f"[{game['name']}] Unhandled tick error: {e}")
+                    log.error(f"[{game['name']}] Unhandled error: {e}", exc_info=True)
             time.sleep(5)
 
     log.info("Ticker stopped cleanly.")

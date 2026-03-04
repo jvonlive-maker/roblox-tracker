@@ -75,6 +75,8 @@ def load_data(game):
             data.setdefault("signal_weights", {"baseline": 1.5, "slot": 1.2, "momentum": 0.6})
             data.setdefault("bias",           0.0)   # rolling residual correction
             data.setdefault("slot_errors",    {})    # per dow_hour MAE
+            data.setdefault("seed_ts",        None)  # date of last reseed
+            data.setdefault("signal_streak",  {"signal": None, "count": 0})  # consecutive signal
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -84,6 +86,7 @@ def load_data(game):
         "session": {}, "ticks": [], "pred_log": [], "week_stats": {},
         "signal_weights": {"baseline": 1.5, "slot": 1.2, "momentum": 0.6},
         "bias": 0.0, "slot_errors": {},
+        "seed_ts": None, "signal_streak": {"signal": None, "count": 0},
     }
 
 def save_data(game, data):
@@ -253,6 +256,102 @@ def slot_confidence(data, dh_key, cv):
     if   cv < 12: return "High"
     elif cv < 22: return "Medium"
     else:         return "Low"
+
+# ── Signal streak tracker ────────────────────────────────────────────────────
+
+def update_streak(data, signal):
+    """
+    Track consecutive ticks with the same signal.
+    Returns (signal, count) — count>=3 means sustained signal.
+    """
+    streak = data.setdefault("signal_streak", {"signal": None, "count": 0})
+    if streak["signal"] == signal and signal not in ("HOLD", "INSUFFICIENT DATA"):
+        streak["count"] += 1
+    elif signal not in ("HOLD", "INSUFFICIENT DATA"):
+        streak["signal"] = signal
+        streak["count"]  = 1
+    else:
+        streak["signal"] = None
+        streak["count"]  = 0
+    data["signal_streak"] = streak
+    return streak["signal"], streak["count"]
+
+# ── Time-to-peak ──────────────────────────────────────────────────────────────
+
+def time_to_peak(data, now_est):
+    """
+    Returns string like 'Peak in ~2h 15m (Fri 4:00 PM  avg 7,140)'.
+    Looks at all remaining slots today and finds the highest average one.
+    Returns None if already at/past today's peak or no slot data.
+    """
+    if not data["slots"]:
+        return None
+    dow      = now_est.weekday()
+    now_mins = now_est.hour * 60 + now_est.minute
+
+    best_avg  = -1
+    best_hour = -1
+    for h in range(now_est.hour + 1, 24):   # only future hours
+        slot = data["slots"].get(f"{dow}_{h}")
+        if slot and slot["avg"] > best_avg:
+            best_avg  = slot["avg"]
+            best_hour = h
+
+    if best_hour == -1:
+        return None   # past peak for today
+
+    # Check it's actually higher than current slot
+    curr_slot = data["slots"].get(f"{dow}_{now_est.hour}")
+    if curr_slot and best_avg <= curr_slot["avg"] * 1.05:
+        return None   # already near peak, not worth showing
+
+    delta_m  = best_hour * 60 - now_mins
+    hrs, mins = divmod(delta_m, 60)
+    peak_fmt = now_est.replace(hour=best_hour, minute=0).strftime("%-I:%M %p")
+    eta      = f"~{hrs}h {mins}m" if hrs > 0 and mins else (f"~{hrs}h" if hrs else f"~{mins}m")
+
+    return f"Peak in {eta}  ({DAYS[dow]} {peak_fmt}  avg {int(best_avg):,})"
+
+# ── Reseed reminder ───────────────────────────────────────────────────────────
+
+RESEED_DAYS = 45
+
+def check_reseed_reminder(game, data):
+    """
+    Sends a Discord alert if seed data is older than RESEED_DAYS.
+    Only fires once per 30 days so it doesn't spam.
+    """
+    seed_ts = data.get("seed_ts")
+    if not seed_ts:
+        return
+    try:
+        seeded_on = datetime.fromisoformat(seed_ts).date()
+    except (ValueError, TypeError):
+        return
+
+    now_date = datetime.now(timezone.utc).date()
+    age_days = (now_date - seeded_on).days
+    if age_days < RESEED_DAYS:
+        return
+
+    last_warned = data.get("reseed_warned")
+    if last_warned:
+        try:
+            if (now_date - datetime.fromisoformat(last_warned).date()).days < 30:
+                return
+        except (ValueError, TypeError):
+            pass
+
+    msg = (
+        f"Seed data is {age_days} days old — slot averages may be drifting.\n"
+        f"\n"
+        f"Download fresh CSVs from Rolimons and run:\n"
+        f"`python3 clear_redis.py && python3 seed_redis.py`\n"
+        f"then redeploy."
+    )
+    notify(game, f"\u26a0\ufe0f {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})
+    data["reseed_warned"] = now_date.isoformat()
+    log.info(f"[{game['name']}] Reseed reminder sent (age={age_days}d)")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -643,12 +742,14 @@ def run_tick(game):
     pct_avg, d_avg = diff_label(ccu, round(avg_hour))
     _,       d_24h = diff_label(ccu, state.midnight_ccu)
 
-    sig       = compute_signal(data, ccu, dow, now_est.hour)
-    sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
-    cv_val    = sig.get("cv")
+    sig          = compute_signal(data, ccu, dow, now_est.hour)
+    sig_emoji    = SIGNAL_EMOJI.get(sig["signal"], "⚪")
+    cv_val       = sig.get("cv")
+    streak_sig, streak_count = update_streak(data, sig["signal"])
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "
              + (f"cv={cv_val:.1f}% — " if cv_val else "— ")
-             + sig["reasoning"])
+             + sig["reasoning"]
+             + (f" [streak x{streak_count}]" if streak_count >= 2 else ""))
 
     pred = predict_next_tick(data, ccu, now_est, dow)
     record_prediction(data, now_est, pred["predicted_ccu"], pred["confidence"],
@@ -690,7 +791,9 @@ def run_tick(game):
     if sig["next2_avg"]: forecast_parts.append(f"{int(sig['next2_avg']):,}")
     forecast_str = " → ".join(forecast_parts) if forecast_parts else "—"
 
-    event_label = detect_event(data, ccu, dow, now_est.hour, pct_15m)
+    event_label  = detect_event(data, ccu, dow, now_est.hour, pct_15m)
+    ttp_str      = time_to_peak(data, now_est)
+    check_reseed_reminder(game, data)
 
     pk       = peak_slot(data)
     peak_str = f"Peak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}" if pk else ""
@@ -724,7 +827,8 @@ def run_tick(game):
     bias_val  = data.get("bias", 0.0)
     bias_note = f"  bias {-bias_val:+.0f}" if abs(bias_val) > 15 else ""
 
-    sig_line1 = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']}{cv_str}"
+    streak_str = f"  x{streak_count}" if streak_count >= 3 else ""
+    sig_line1  = f"{sig_emoji} {sig['signal']}{streak_str}  •  {sig['confidence']}{cv_str}"
     sig_line2 = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
 
     message = (
@@ -742,6 +846,7 @@ def run_tick(game):
         f"Next tick  {pred_str}{bias_note}"
         f"{sl_tp_lines}"
         + (f"\n{peak_str}" if peak_str else "")
+        + (f"\n{ttp_str}" if ttp_str else "")
         + acc_str
     )
 

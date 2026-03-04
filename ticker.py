@@ -4,6 +4,7 @@ Multi-game Roblox CCU ticker.
 - Polls every game in config.GAMES every 15 min
 - Sends alerts to Discord webhook
 - Persists state in Upstash Redis
+- Self-improving: adaptive signal weights, bias correction, per-slot error memory
 Requires: pip install requests
 """
 
@@ -68,14 +69,22 @@ def load_data(game):
             data.setdefault("last_daily",   None)
             data.setdefault("session",      {})
             data.setdefault("ticks",        [])
-            data.setdefault("pred_log",     [])   # prediction accuracy log
-            data.setdefault("week_stats",   {})   # rolling weekly stats
+            data.setdefault("pred_log",     [])
+            data.setdefault("week_stats",   {})
+            # Learning state
+            data.setdefault("signal_weights", {"baseline": 1.5, "slot": 1.2, "momentum": 0.6})
+            data.setdefault("bias",           0.0)   # rolling residual correction
+            data.setdefault("slot_errors",    {})    # per dow_hour MAE
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
-    return {"slots": {}, "trend": 0.0, "last_daily": None,
-            "ath": game["ath_floor"], "ath_ts": None,
-            "session": {}, "ticks": [], "pred_log": [], "week_stats": {}}
+    return {
+        "slots": {}, "trend": 0.0, "last_daily": None,
+        "ath": game["ath_floor"], "ath_ts": None,
+        "session": {}, "ticks": [], "pred_log": [], "week_stats": {},
+        "signal_weights": {"baseline": 1.5, "slot": 1.2, "momentum": 0.6},
+        "bias": 0.0, "slot_errors": {},
+    }
 
 def save_data(game, data):
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))
@@ -106,71 +115,144 @@ def record_snapshot(data, game, dow, hour, ccu, now_est):
         data["ticks"].append({"ts": tick_ts, "ccu": ccu})
         data["ticks"] = data["ticks"][-2016:]
 
-    # Weekly stats — keyed by ISO week e.g. "2026-W10"
     week_key = now_est.strftime("%Y-W%W")
-    ws = data["week_stats"].setdefault(week_key, {"high": ccu, "low": ccu, "sum": 0, "n": 0,
-                                                   "pred_hits": 0, "pred_total": 0})
-    ws["high"]  = max(ws["high"], ccu)
-    ws["low"]   = min(ws["low"],  ccu)
-    ws["sum"]  += ccu
-    ws["n"]    += 1
-    # Keep only last 2 weeks
-    all_weeks = sorted(data["week_stats"].keys())
-    for old in all_weeks[:-2]:
+    ws = data["week_stats"].setdefault(week_key, {
+        "high": ccu, "low": ccu, "sum": 0, "n": 0, "pred_hits": 0, "pred_total": 0
+    })
+    ws["high"] = max(ws["high"], ccu)
+    ws["low"]  = min(ws["low"],  ccu)
+    ws["sum"] += ccu
+    ws["n"]   += 1
+    for old in sorted(data["week_stats"].keys())[:-2]:
         del data["week_stats"][old]
 
     return slot["avg"], data["ath"], is_new_ath
 
-# ── Prediction accuracy log ───────────────────────────────────────────────────
+# ── Prediction log & scoring ──────────────────────────────────────────────────
 
-def record_prediction(data, now_est, predicted_ccu, confidence):
-    """Store a prediction so next tick can score it."""
+def record_prediction(data, now_est, predicted_ccu, confidence, dow, hour, signals_used):
     if predicted_ccu is None:
         return
-    entry = {
-        "ts":        now_est.strftime("%Y-%m-%dT%H:%M"),
-        "predicted": predicted_ccu,
-        "confidence": confidence,
-        "actual":    None,   # filled next tick
-    }
-    data["pred_log"].append(entry)
-    data["pred_log"] = data["pred_log"][-100:]
+    data["pred_log"].append({
+        "ts":           now_est.strftime("%Y-%m-%dT%H:%M"),
+        "predicted":    predicted_ccu,
+        "confidence":   confidence,
+        "actual":       None,
+        "dow_hour":     f"{dow}_{hour}",
+        "signals_used": signals_used,   # list of signal names that fired
+    })
+    data["pred_log"] = data["pred_log"][-200:]
 
-def score_last_prediction(data, ccu):
-    """Find the most recent unscored prediction and fill in actual."""
+def score_last_prediction(data, ccu, now_dow, now_hour):
+    """
+    Score the most recent unscored prediction.
+    Also:
+      1. Update per-slot error memory (slot_errors)
+      2. Update rolling bias (systematic over/under prediction)
+      3. Update adaptive signal weights based on which signals were most accurate
+    Returns the scored entry or None.
+    """
+    scored_entry = None
     for entry in reversed(data["pred_log"]):
         if entry["actual"] is None:
             entry["actual"] = ccu
-            return entry
-    return None
+            scored_entry    = entry
+            break
+
+    if scored_entry is None:
+        return None
+
+    error     = scored_entry["predicted"] - ccu   # signed: + = predicted too high
+    abs_error = abs(error)
+    dh_key    = scored_entry.get("dow_hour", f"{now_dow}_{now_hour}")
+
+    # ── 1. Per-slot error memory ──────────────────────────────
+    se = data["slot_errors"].setdefault(dh_key, {"mae": abs_error, "n": 1, "_errs": [abs_error]})
+    errs = se.get("_errs", [se["mae"]])
+    errs.append(abs_error)
+    errs = errs[-20:]
+    se["_errs"] = errs
+    se["n"]     = len(errs)
+    se["mae"]   = sum(errs) / len(errs)
+    data["slot_errors"][dh_key] = se
+
+    # ── 2. Rolling bias correction ────────────────────────────
+    # Exponential moving average of signed error (alpha=0.15)
+    # Positive bias = model is consistently predicting too high → subtract next time
+    alpha        = 0.15
+    data["bias"] = data["bias"] * (1 - alpha) + error * alpha
+
+    # ── 3. Adaptive signal weights ────────────────────────────
+    # We don't know each signal's individual contribution to the error, but we
+    # track which signal *combination* was used and update weights proportionally.
+    # Simpler heuristic: if error is large and momentum was used, decay momentum
+    # weight slightly. If error is small, boost whichever signals fired.
+    signals_used = scored_entry.get("signals_used", [])
+    weights      = data["signal_weights"]
+    pct_error    = abs_error / max(ccu, 1) * 100
+
+    if pct_error < 5:
+        # Accurate — modestly boost all signals that contributed
+        for s in signals_used:
+            if s in weights:
+                weights[s] = min(2.5, weights[s] * 1.03)
+    elif pct_error > 20:
+        # Inaccurate — decay all signals that contributed
+        for s in signals_used:
+            if s in weights:
+                weights[s] = max(0.2, weights[s] * 0.95)
+
+    # Renormalise so they don't drift to infinity — keep sum ≈ 3.3 (original sum)
+    total = sum(weights.values())
+    if total > 0:
+        target = 3.3
+        factor = target / total
+        for k in weights:
+            weights[k] = round(weights[k] * factor, 4)
+
+    data["signal_weights"] = weights
+
+    log.info(f"Scored: pred={scored_entry['predicted']:,} actual={ccu:,} "
+             f"err={error:+,} bias={data['bias']:+.1f} "
+             f"weights={weights}")
+    return scored_entry
 
 def prediction_accuracy(data):
-    """
-    Returns (mae, directional_pct, n) over scored predictions.
-    directional_pct = % of predictions where we got up/down right.
-    """
     scored = [e for e in data["pred_log"] if e["actual"] is not None]
     if len(scored) < 3:
         return None, None, 0
-    errors    = [abs(e["predicted"] - e["actual"]) for e in scored]
-    mae       = sum(errors) / len(errors)
-    # Directional: compare predicted delta sign to actual delta sign
-    # We need previous actual to know direction — use consecutive scored entries
-    hits = 0
-    total = 0
+    errors = [abs(e["predicted"] - e["actual"]) for e in scored]
+    mae    = sum(errors) / len(errors)
+    hits = total = 0
     for i in range(1, len(scored)):
         prev = scored[i-1]["actual"]
         curr = scored[i]["actual"]
         pred = scored[i]["predicted"]
-        if prev is None or curr is None:
-            continue
-        actual_dir = curr - prev
-        pred_dir   = pred - prev
-        if actual_dir * pred_dir > 0:   # same sign
-            hits += 1
+        if prev is None or curr is None: continue
+        if (curr - prev) * (pred - prev) > 0: hits += 1
         total += 1
     directional = (hits / total * 100) if total > 0 else None
     return mae, directional, len(scored)
+
+def slot_confidence(data, dh_key, cv):
+    """
+    Confidence based on OBSERVED per-slot error history (not just CV).
+    After enough predictions, actual MAE beats CV as a predictor of reliability.
+    Falls back to CV-based if no slot error history yet.
+    """
+    se = data["slot_errors"].get(dh_key)
+    if se and se["n"] >= 5:
+        # Use actual observed MAE relative to last known avg for this slot
+        slot = data["slots"].get(dh_key)
+        if slot and slot["avg"] > 0:
+            obs_cv = se["mae"] / slot["avg"] * 100
+            if   obs_cv < 8:  return "High"
+            elif obs_cv < 18: return "Medium"
+            else:             return "Low"
+    # Fall back to CV%
+    if   cv < 12: return "High"
+    elif cv < 22: return "Medium"
+    else:         return "Low"
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -236,7 +318,6 @@ def get_slot(data, dow, hour):
     return data["slots"].get(f"{dow}_{hour % 24}")
 
 def peak_slot(data):
-    """Return (day_name, hour, avg) for the historically highest slot."""
     best_key = max(data["slots"], key=lambda k: data["slots"][k]["avg"], default=None)
     if not best_key:
         return None
@@ -265,12 +346,14 @@ def compute_signal(data, ccu, dow, hour):
     curr_slot  = get_slot(data, dow, hour)
     next_slot  = get_slot(data, dow, hour + 1)
     next2_slot = get_slot(data, dow, hour + 2)
+    dh_key     = f"{dow}_{hour}"
 
     if curr_slot is None or curr_slot["n"] < config.SIGNAL_MIN_SAMPLES:
         return {
             "signal": "INSUFFICIENT DATA", "confidence": "—",
             "reasoning": f"Need {config.SIGNAL_MIN_SAMPLES}+ samples for this slot.",
-            "curr_avg": None, "next1_avg": None, "next2_avg": None, "cv": None,
+            "curr_avg": None, "next1_avg": None, "next2_avg": None,
+            "cv": None, "std": None,
         }
 
     curr_avg  = trend_adjusted_avg(curr_slot,  data["trend"], data["last_daily"], ccu)
@@ -279,9 +362,7 @@ def compute_signal(data, ccu, dow, hour):
     cv        = curr_slot["cv"]
     pct       = (ccu - curr_avg) / curr_avg * 100
 
-    if   cv < 12: confidence = "High"
-    elif cv < 22: confidence = "Medium"
-    else:         confidence = "Low"
+    confidence = slot_confidence(data, dh_key, cv)
 
     trend_up = trend_down = False
     trend_str = "trend unclear"
@@ -290,9 +371,9 @@ def compute_signal(data, ccu, dow, hour):
         if next2_avg is not None:
             d2 = (next2_avg - curr_avg) / curr_avg * 100
             if   d1 >  config.SIGNAL_TREND_PCT and d2 >  config.SIGNAL_TREND_PCT:
-                trend_up   = True; trend_str = f"avg rises +{d1:.1f}% → +{d2:.1f}% over 2h"
+                trend_up   = True; trend_str = f"avg rises +{d1:.1f}% then +{d2:.1f}% over 2h"
             elif d1 < -config.SIGNAL_TREND_PCT and d2 < -config.SIGNAL_TREND_PCT:
-                trend_down = True; trend_str = f"avg falls {d1:.1f}% → {d2:.1f}% over 2h"
+                trend_down = True; trend_str = f"avg falls {d1:.1f}% then {d2:.1f}% over 2h"
             else:
                 trend_str = f"mixed next 2h ({d1:+.1f}%, {d2:+.1f}%)"
         else:
@@ -323,6 +404,10 @@ def predict_next_tick(data, ccu, now_est, dow):
     hour   = now_est.hour
     minute = now_est.minute
     ticks  = data.get("ticks", [])
+    dh_key = f"{dow}_{hour}"
+
+    # Adaptive weights learned from prediction history
+    weights_cfg = data.get("signal_weights", {"baseline": 1.5, "slot": 1.2, "momentum": 0.6})
 
     curr_slot = get_slot(data, dow, hour)
     next_slot = get_slot(data, dow, hour + 1)
@@ -338,8 +423,9 @@ def predict_next_tick(data, ccu, now_est, dow):
 
     momentum_delta = None
     if len(ticks) >= 3:
-        recent  = ticks[-3:]
-        deltas  = [recent[i+1]["ccu"] - recent[i]["ccu"] for i in range(len(recent)-1)]
+        recent = ticks[-3:]
+        deltas = [recent[i+1]["ccu"] - recent[i]["ccu"] for i in range(len(recent)-1)]
+        # Weight most recent move heavier
         momentum_delta = deltas[0] * 0.4 + deltas[1] * 0.6
 
     slot_deltas_list = []
@@ -355,39 +441,67 @@ def predict_next_tick(data, ccu, now_est, dow):
             slot_deltas_list.append(ticks[i+1]["ccu"] - ticks[i]["ccu"])
     slot_delta = sum(slot_deltas_list) / len(slot_deltas_list) if slot_deltas_list else None
 
-    signals = []; weights = []
+    signals      = []
+    weights      = []
+    signals_used = []
+
     if baseline_delta is not None:
+        # Scale baseline weight by inverse CV (low volatility = trust more)
+        cv_factor = max(0.1, 1.0 - (baseline_cv or 50) / 100)
         signals.append(baseline_delta)
-        weights.append(max(0.1, 1.0 - baseline_cv / 100) * 1.5)
+        weights.append(weights_cfg["baseline"] * cv_factor)
+        signals_used.append("baseline")
+
     if slot_delta is not None:
+        n_factor = min(1.0, len(slot_deltas_list) / 8)
         signals.append(slot_delta)
-        weights.append(min(1.0, len(slot_deltas_list) / 8) * 1.2)
+        weights.append(weights_cfg["slot"] * n_factor)
+        signals_used.append("slot")
+
     if momentum_delta is not None:
         signals.append(momentum_delta)
-        weights.append(0.6)
+        weights.append(weights_cfg["momentum"])
+        signals_used.append("momentum")
 
     if not signals:
         return {"predicted_ccu": None, "delta": None, "delta_pct": None,
-                "confidence": "—", "detail": "insufficient data", "std": None}
+                "confidence": "—", "detail": "insufficient data",
+                "std": None, "signals_used": []}
 
-    total_w   = sum(weights)
-    delta     = sum(s * w for s, w in zip(signals, weights)) / total_w
-    predicted = round(ccu + delta)
+    total_w = sum(weights)
+    delta   = sum(s * w for s, w in zip(signals, weights)) / total_w
+
+    # ── Bias correction ───────────────────────────────────────
+    # Subtract the rolling signed error so systematic drift is removed
+    bias        = data.get("bias", 0.0)
+    delta_corr  = delta - bias
+    bias_str    = f" bias_corr={-bias:+.0f}" if abs(bias) > 10 else ""
+
+    predicted = round(ccu + delta_corr)
     delta_int = predicted - ccu
-    delta_pct = delta / ccu * 100 if ccu else 0
+    delta_pct = delta_corr / ccu * 100 if ccu else 0
 
-    n_signals = len(signals)
-    if n_signals == 3 and baseline_cv is not None and baseline_cv < 15:
-        confidence = "High"
-    elif n_signals >= 2:
-        confidence = "Medium"
+    # Confidence: use observed slot MAE if available, else signal count + CV
+    se = data["slot_errors"].get(dh_key)
+    if se and se["n"] >= 5:
+        obs_cv = se["mae"] / max(ccu, 1) * 100
+        if   obs_cv < 8:  confidence = "High"
+        elif obs_cv < 18: confidence = "Medium"
+        else:             confidence = "Low"
     else:
-        confidence = "Low"
+        n_signals = len(signals)
+        if n_signals == 3 and baseline_cv is not None and baseline_cv < 15:
+            confidence = "High"
+        elif n_signals >= 2:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
 
     parts = []
     if baseline_delta is not None: parts.append(f"baseline {baseline_delta:+.0f}")
     if slot_delta     is not None: parts.append(f"slot {slot_delta:+.0f} (n={len(slot_deltas_list)})")
     if momentum_delta is not None: parts.append(f"momentum {momentum_delta:+.0f}")
+    if abs(bias) > 10:             parts.append(f"bias {-bias:+.0f}")
 
     return {
         "predicted_ccu": predicted,
@@ -396,15 +510,12 @@ def predict_next_tick(data, ccu, now_est, dow):
         "confidence":    confidence,
         "detail":        " | ".join(parts),
         "std":           baseline_std,
+        "signals_used":  signals_used,
     }
 
 # ── Event detection ───────────────────────────────────────────────────────────
 
 def detect_event(data, ccu, dow, hour, pct_15m):
-    """
-    Returns event label if CCU spikes 2x the slot avg within an hour,
-    suggesting a game update / double XP event / viral moment.
-    """
     slot = get_slot(data, dow, hour)
     if slot is None or slot["avg"] == 0:
         return None
@@ -456,30 +567,26 @@ def fetch_ccu(game, retries=3):
 # ── Weekly summary ────────────────────────────────────────────────────────────
 
 def send_weekly_summary(game, data):
-    now_est  = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
-    # Last week key
+    now_est   = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     last_week = (now_est - timedelta(days=7)).strftime("%Y-W%W")
-    ws = data["week_stats"].get(last_week)
+    ws        = data["week_stats"].get(last_week)
     if not ws or ws["n"] == 0:
         return
 
     avg = ws["sum"] // ws["n"]
     mae, dir_pct, n_pred = prediction_accuracy(data)
     pk = peak_slot(data)
+    w  = data.get("signal_weights", {})
 
-    acc_str = ""
-    if mae is not None:
-        acc_str = f"\nPred accuracy  MAE {mae:.0f}  direction {dir_pct:.0f}%  (n={n_pred})"
+    acc_str  = f"\nPred  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
+    peak_str = f"\nPeak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}" if pk else ""
+    w_str    = (f"\nWeights  base {w.get('baseline',0):.2f}  "
+                f"slot {w.get('slot',0):.2f}  "
+                f"mom {w.get('momentum',0):.2f}") if w else ""
+    bias_str = f"\nBias correction  {-data.get('bias',0):+.0f} CCU" if abs(data.get("bias",0)) > 5 else ""
 
-    peak_str = ""
-    if pk:
-        peak_str = f"\nPeak slot  {pk[0]} {pk[2]:02d}:00  avg {pk[1]:,.0f}"
-
-    msg = (
-        f"↑ {ws['high']:,}  ↓ {ws['low']:,}  avg {avg:,}"
-        f"{acc_str}"
-        f"{peak_str}"
-    )
+    msg = (f"↑ {ws['high']:,}  ↓ {ws['low']:,}  avg {avg:,}"
+           f"{acc_str}{peak_str}{w_str}{bias_str}")
     notify(game, f"📊 {game['name']} — Weekly Summary", msg, {"signal": "HOLD"})
     log.info(f"[{game['name']}] Weekly summary sent.")
 
@@ -492,8 +599,7 @@ def send_daily_summary(game, data):
     low = state.intraday_low or 0
     msg = f"↑ {state.intraday_high:,}  ↓ {low:,}  avg {avg:,}"
     notify(game, f"📅 {game['name']} — Daily Summary", msg, {"signal": "HOLD"})
-    log.info(f"[{game['name']}] Daily summary — "
-             f"high={state.intraday_high:,} low={low:,} avg={avg:,}")
+    log.info(f"[{game['name']}] Daily — high={state.intraday_high:,} low={low:,} avg={avg:,}")
 
 # ── Main tick ─────────────────────────────────────────────────────────────────
 
@@ -505,12 +611,10 @@ def run_tick(game):
     today   = now_est.date()
     state   = get_state(game)
 
-    # Day rollover
     if state.last_date != today:
         data = load_data(game)
         if state.last_date is not None:
             send_daily_summary(game, data)
-            # Weekly summary: fire Sunday night at rollover to Monday
             if dow == 0:
                 send_weekly_summary(game, data)
         state.intraday_high  = 0
@@ -522,14 +626,8 @@ def run_tick(game):
     ccu = fetch_ccu(game)
     if ccu is None: return
 
-    data = load_data(game)
-
-    # Score last prediction before updating slots
-    scored = score_last_prediction(data, ccu)
-    if scored:
-        err = abs(scored["predicted"] - ccu)
-        log.info(f"[{game['name']}] Pred scored: predicted={scored['predicted']:,} "
-                 f"actual={ccu:,} err={err:,}")
+    data   = load_data(game)
+    scored = score_last_prediction(data, ccu, dow, now_est.hour)
 
     avg_hour, ath, is_new_ath = record_snapshot(data, game, dow, now_est.hour, ccu, now_est)
 
@@ -545,7 +643,6 @@ def run_tick(game):
     pct_avg, d_avg = diff_label(ccu, round(avg_hour))
     _,       d_24h = diff_label(ccu, state.midnight_ccu)
 
-    # Signal
     sig       = compute_signal(data, ccu, dow, now_est.hour)
     sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
     cv_val    = sig.get("cv")
@@ -553,9 +650,9 @@ def run_tick(game):
              + (f"cv={cv_val:.1f}% — " if cv_val else "— ")
              + sig["reasoning"])
 
-    # Prediction
     pred = predict_next_tick(data, ccu, now_est, dow)
-    record_prediction(data, now_est, pred["predicted_ccu"], pred["confidence"])
+    record_prediction(data, now_est, pred["predicted_ccu"], pred["confidence"],
+                      dow, now_est.hour, pred.get("signals_used", []))
 
     if pred["predicted_ccu"] is not None:
         sign     = "+" if pred["delta"] >= 0 else ""
@@ -565,44 +662,43 @@ def run_tick(game):
     else:
         pred_str = "—"
 
-    # Stop loss / take profit — only when High confidence + low CV
+    # Stop loss / take profit — High confidence + low observed error
     sl_tp_lines = ""
-    if (pred["confidence"] == "High"
-            and pred["predicted_ccu"] is not None
-            and pred["std"] is not None
-            and cv_val is not None and cv_val < 12):
+    dh_key = f"{dow}_{now_est.hour}"
+    se     = data["slot_errors"].get(dh_key)
+    use_sl_tp = (
+        pred["confidence"] == "High"
+        and pred["predicted_ccu"] is not None
+        and pred["std"] is not None
+        and (
+            (se and se["n"] >= 5 and se["mae"] / max(ccu, 1) * 100 < 8)
+            or (cv_val is not None and cv_val < 12)
+        )
+    )
+    if use_sl_tp:
         std = pred["std"]
         tp  = round(pred["predicted_ccu"] + 1.0 * std)
         sl  = round(pred["predicted_ccu"] - 1.5 * std)
         sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
-        log.info(f"[{game['name']}] SL/TP: sl={sl:,} tp={tp:,} (std={std:.0f})")
+        log.info(f"[{game['name']}] SL/TP: sl={sl:,} tp={tp:,}")
 
-    # Prediction accuracy summary
     mae, dir_pct, n_pred = prediction_accuracy(data)
-    acc_str = ""
-    if mae is not None:
-        acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}"
+    acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
 
-    # Hourly forecast
     forecast_parts = []
     if sig["next1_avg"]: forecast_parts.append(f"{int(sig['next1_avg']):,}")
     if sig["next2_avg"]: forecast_parts.append(f"{int(sig['next2_avg']):,}")
     forecast_str = " → ".join(forecast_parts) if forecast_parts else "—"
 
-    # Event detection
     event_label = detect_event(data, ccu, dow, now_est.hour, pct_15m)
 
-    # Peak slot context
-    pk = peak_slot(data)
+    pk       = peak_slot(data)
     peak_str = f"Peak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}" if pk else ""
 
-    # ATH distinction
     if is_new_ath:
-        ath_ts   = data.get("ath_ts")
-        prev_ath = game["ath_floor"]
+        prev_ath  = game["ath_floor"]
         pct_above = (ccu - prev_ath) / prev_ath * 100 if prev_ath else 0
-        title = (f"🏆 {game['name']} NEW ATH: {ccu:,}  "
-                 f"(+{pct_above:.1f}% above prev)")
+        title = f"🏆 {game['name']} NEW ATH: {ccu:,}  (+{pct_above:.1f}% above prev)"
     elif state.last_tick is not None and pct_15m > config.VOLATILITY_PCT:
         title = f"📈 {game['name']} SPIKE: {ccu:,}"
     elif state.last_tick is not None and pct_15m < -config.VOLATILITY_PCT:
@@ -614,9 +710,7 @@ def run_tick(game):
     else:
         title = f"{game['name']} • {DAYS[dow]} {now_est.strftime('%-I:%M %p')}  {ccu:,}"
 
-    # Trend label — event overrides
-    if event_label:
-        trend = event_label
+    if event_label:           trend = event_label
     elif pct_avg >  config.BREAKOUT_PCT: trend = "🔥 BREAKOUT"
     elif pct_avg < -config.DROP_AVG_PCT: trend = "📉 BELOW AVG"
     else:                                trend = "⚖️ Stable"
@@ -625,6 +719,10 @@ def run_tick(game):
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
     pct_str     = f"{(ccu-sig['curr_avg'])/sig['curr_avg']*100:+.1f}%" if sig["curr_avg"] else ""
     cv_str      = f"  cv {cv_val:.0f}%" if cv_val is not None else ""
+
+    # Show bias correction in notification if meaningful
+    bias_val  = data.get("bias", 0.0)
+    bias_note = f"  bias {-bias_val:+.0f}" if abs(bias_val) > 15 else ""
 
     sig_line1 = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']}{cv_str}"
     sig_line2 = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
@@ -641,7 +739,7 @@ def run_tick(game):
         f"\n"
         f"{sig_line1}\n"
         f"{sig_line2}\n"
-        f"Next tick  {pred_str}"
+        f"Next tick  {pred_str}{bias_note}"
         f"{sl_tp_lines}"
         + (f"\n{peak_str}" if peak_str else "")
         + acc_str
@@ -653,7 +751,8 @@ def run_tick(game):
     notify(game, title, message, sig)
     state.last_tick = ccu
     log.info(f"[{game['name']}] Tick @ {time_label} — "
-             f"CCU: {ccu:,} | Avg: {round(avg_hour):,} | ATH: {ath:,}")
+             f"CCU: {ccu:,} | Avg: {round(avg_hour):,} | ATH: {ath:,} | "
+             f"bias={bias_val:+.1f} weights={data['signal_weights']}")
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
 

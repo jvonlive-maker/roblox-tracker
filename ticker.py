@@ -480,7 +480,10 @@ def compute_signal(data, ccu, dow, hour):
             elif d1 < -config.SIGNAL_TREND_PCT: trend_down = True; trend_str = f"avg falls {d1:.1f}% next hr"
             else: trend_str = f"flat next hr ({d1:+.1f}%)"
 
-    if   pct < -config.SIGNAL_LONG_PCT  and trend_up:
+    # If CCU is >45% below adj avg it's structural decline, not a dip — never LONG
+    extreme_decline = pct < -45
+
+    if   pct < -config.SIGNAL_LONG_PCT and trend_up and not extreme_decline:
         signal = "LONG";  reasoning = f"{pct:.1f}% below adj. avg — {trend_str} — recovery expected"
     elif pct >  config.SIGNAL_SHORT_PCT and trend_down:
         signal = "SHORT"; reasoning = f"+{pct:.1f}% above adj. avg — {trend_str} — pullback expected"
@@ -745,7 +748,9 @@ def run_tick(game):
     sig          = compute_signal(data, ccu, dow, now_est.hour)
     sig_emoji    = SIGNAL_EMOJI.get(sig["signal"], "⚪")
     cv_val       = sig.get("cv")
-    streak_sig, streak_count = update_streak(data, sig["signal"])
+    # Only track streaks for High/Medium confidence — Low is too noisy
+    streak_input  = sig["signal"] if sig.get("confidence") in ("High", "Medium") else "HOLD"
+    streak_sig, streak_count = update_streak(data, streak_input)
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "
              + (f"cv={cv_val:.1f}% — " if cv_val else "— ")
              + sig["reasoning"]
@@ -795,8 +800,14 @@ def run_tick(game):
     ttp_str      = time_to_peak(data, now_est)
     check_reseed_reminder(game, data)
 
-    pk       = peak_slot(data)
-    peak_str = f"Peak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}" if pk else ""
+    pk = peak_slot(data)
+    # Use time-to-peak if available (more useful), fall back to static peak slot
+    if ttp_str:
+        peak_str = ttp_str   # already has day/time/avg
+    elif pk:
+        peak_str = f"Peak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}"
+    else:
+        peak_str = ""
 
     if is_new_ath:
         prev_ath  = game["ath_floor"]
@@ -846,7 +857,6 @@ def run_tick(game):
         f"Next tick  {pred_str}{bias_note}"
         f"{sl_tp_lines}"
         + (f"\n{peak_str}" if peak_str else "")
-        + (f"\n{ttp_str}" if ttp_str else "")
         + acc_str
     )
 

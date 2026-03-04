@@ -327,6 +327,95 @@ def compute_signal(data: dict, ccu: int, hour: int, is_weekend: bool) -> dict:
     }
 
 
+
+# ───────────────────────────────────────────────────────────
+# NEXT-TICK PREDICTOR
+# ───────────────────────────────────────────────────────────
+def predict_next_tick(data: dict, ccu: int, now_est, is_weekend: bool) -> dict:
+    """
+    Predicts the CCU change for the NEXT 15-min tick using two signals:
+
+    1. Momentum  — average change between consecutive ticks over recent history
+                   at the same weekday + hour + 15-min slot
+    2. Hour drift — difference between current hour avg and next hour avg,
+                    prorated to 15 minutes (1/4 of the hourly move)
+
+    Returns:
+        predicted_ccu   int
+        delta           int   (predicted_ccu - ccu)
+        delta_pct       float
+        confidence      str   Low / Medium / High
+        basis           str   human-readable explanation
+    """
+    group    = "weekend" if is_weekend else "weekday"
+    hour     = now_est.hour
+    minute   = now_est.minute   # 0, 15, 30, or 45
+    ticks    = data.get("ticks", [])
+
+    # ── Signal 1: same-slot momentum ──────────────────────────
+    # Find historical ticks that landed on the same weekday + hour + minute
+    # and compute the average move to the *following* tick
+    from datetime import datetime
+    slot_deltas = []
+    for i in range(len(ticks) - 1):
+        try:
+            t0 = datetime.strptime(ticks[i]["ts"],   "%Y-%m-%dT%H:%M")
+            t1 = datetime.strptime(ticks[i+1]["ts"], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        # Match weekday, hour, and 15-min slot
+        if (t0.weekday() >= 5) == is_weekend and t0.hour == hour and t0.minute == minute:
+            # Only use if the next tick is actually 15 min later (not a gap)
+            if (t1 - t0).seconds == 900:
+                slot_deltas.append(ticks[i+1]["ccu"] - ticks[i]["ccu"])
+
+    # ── Signal 2: hour-boundary drift ─────────────────────────
+    # How much does the hourly avg change next hour, prorated to 15 min?
+    stats     = data["stats"]
+    curr_slot = stats[group].get(str(hour), [])
+    next_slot = stats[group].get(str((hour + 1) % 24), [])
+    hour_drift_15 = None
+    if len(curr_slot) >= config.SIGNAL_MIN_SAMPLES and len(next_slot) >= config.SIGNAL_MIN_SAMPLES:
+        curr_avg   = sum(curr_slot) / len(curr_slot)
+        next_avg   = sum(next_slot) / len(next_slot)
+        # Full hourly drift prorated to 15 min (one tick = 1/4 of the hour)
+        hour_drift_15 = (next_avg - curr_avg) / 4
+
+    # ── Combine signals ────────────────────────────────────────
+    if slot_deltas and hour_drift_15 is not None:
+        # Blend: 60% momentum, 40% hour drift
+        momentum   = sum(slot_deltas) / len(slot_deltas)
+        delta      = momentum * 0.6 + hour_drift_15 * 0.4
+        n_samples  = len(slot_deltas)
+        confidence = "High" if n_samples >= 8 else "Medium" if n_samples >= 3 else "Low"
+        basis      = f"{n_samples} same-slot samples + hour drift {hour_drift_15:+.0f}"
+    elif slot_deltas:
+        delta      = sum(slot_deltas) / len(slot_deltas)
+        n_samples  = len(slot_deltas)
+        confidence = "Medium" if n_samples >= 3 else "Low"
+        basis      = f"{n_samples} same-slot samples (no hour drift data)"
+    elif hour_drift_15 is not None:
+        delta      = hour_drift_15
+        confidence = "Low"
+        basis      = "hour drift only (no same-slot history)"
+    else:
+        return {
+            "predicted_ccu": None, "delta": None, "delta_pct": None,
+            "confidence": "—", "basis": "insufficient data"
+        }
+
+    predicted_ccu = round(ccu + delta)
+    delta_int     = predicted_ccu - ccu
+    delta_pct     = delta / ccu * 100 if ccu else 0
+
+    return {
+        "predicted_ccu": predicted_ccu,
+        "delta":         delta_int,
+        "delta_pct":     delta_pct,
+        "confidence":    confidence,
+        "basis":         basis,
+    }
+
 # ───────────────────────────────────────────────────────────
 # NTFY
 # ───────────────────────────────────────────────────────────
@@ -457,7 +546,15 @@ def run_tick(game: dict):
     sig_emoji = SIGNAL_EMOJI.get(sig["signal"], "⚪")
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) — {sig['reasoning']}")
 
-    # Forecast
+    pred = predict_next_tick(data, ccu, now_est, is_weekend)
+    if pred["predicted_ccu"] is not None:
+        sign = "+" if pred["delta"] >= 0 else ""
+        pred_str = f"{pred['predicted_ccu']:,} ({sign}{pred['delta']:,} / {sign}{pred['delta_pct']:.1f}%) • {pred['confidence']}"
+        log.info(f"[{game['name']}] Next tick prediction: {pred_str}")
+    else:
+        pred_str = "—"
+
+    # Forecast (hourly)
     forecast_parts = []
     if sig["next1_avg"] is not None:
         forecast_parts.append(f"{int(sig['next1_avg']):,}")
@@ -495,7 +592,7 @@ def run_tick(game: dict):
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
     pct_str     = f"{(ccu - sig['curr_avg']) / sig['curr_avg'] * 100:+.1f}%" if sig["curr_avg"] else ""
     sig_line1   = f"{sig_emoji} {sig['signal']}  •  {sig['confidence']} confidence"
-    sig_line2   = f"CCU {pct_str} vs avg  •  Next: {forecast_str}"
+    sig_line2   = f"CCU {pct_str} vs avg  •  1h: {forecast_str}"
 
     message = (
         f"{trend}  •  {time_label}\n"
@@ -508,7 +605,8 @@ def run_tick(game: dict):
         f"↑ {state.intraday_high:,}  ↓ {low_display}  •  ATH 🏆 {ath:,}\n"
         f"\n"
         f"{sig_line1}\n"
-        f"{sig_line2}"
+        f"{sig_line2}\n"
+        f"Next tick  {pred_str}"
     )
 
     notify(game, title, message, sig)

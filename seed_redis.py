@@ -9,9 +9,9 @@ Run once before starting the ticker:
   UPSTASH_REDIS_REST_URL=x UPSTASH_REDIS_REST_TOKEN=y python3 seed_redis.py
 """
 
-import csv, json, math, os, sys, statistics
+import csv, json, os, sys, statistics
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from urllib.parse import quote
 
 import requests
@@ -22,11 +22,13 @@ REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 http = requests.Session()
 
 def _hdrs(): return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
 def redis_get(k):
     r = http.get(f"{REDIS_URL}/get/{quote(k,safe='')}", headers=_hdrs(), timeout=10)
     r.raise_for_status()
     v = r.json().get("result")
     return v if isinstance(v, str) else None
+
 def redis_set(k, v):
     http.get(f"{REDIS_URL}/set/{quote(k,safe='')}/{quote(v,safe='')}",
              headers=_hdrs(), timeout=15).raise_for_status()
@@ -41,16 +43,6 @@ def load_csv(path):
                   + timedelta(hours=config.TIMEZONE_OFFSET))
             rows.append((dt, int(row["Players"])))
     return sorted(rows)
-
-def compute_slot_stats(values):
-    """Given a list of CCU values, return avg, stddev, cv, n."""
-    n = len(values)
-    if n == 0:
-        return None
-    avg = sum(values) / n
-    std = statistics.stdev(values) if n > 1 else 0.0
-    cv  = (std / avg * 100) if avg > 0 else 0.0
-    return {"avg": round(avg, 2), "std": round(std, 2), "cv": round(cv, 2), "n": n}
 
 def compute_trend(daily_rows, days=30):
     """Linear regression slope (CCU/day) over last `days` days."""
@@ -68,7 +60,7 @@ def compute_trend(daily_rows, days=30):
 
 def seed_game(game):
     name = game["name"]
-    base = game.get("csv_base", name.lower())  # e.g. "ff2"
+    base = game.get("csv_base", name.lower())
     print(f"\n{'='*55}\nSeeding: {name}")
 
     daily_rows  = load_csv(f"{base}_daily.csv")
@@ -86,39 +78,48 @@ def seed_game(game):
         else:
             print(f"  {label:8s}: not found")
 
-    # ── Build dow x hour slots from hourly data ────────────────
-    # dow = 0 (Mon) … 6 (Sun)
-    dow_hour: dict[str, list[int]] = defaultdict(list)  # key = "dow_hour"
-    for dt, ccu in hourly_rows:
-        key = f"{dt.weekday()}_{dt.hour}"
-        dow_hour[key].append(ccu)
+    # ── Build dow x hour slots ─────────────────────────────────
+    # Collect all CCU values per (dow, hour) key
+    dow_hour: dict[str, list[int]] = defaultdict(list)
 
-    # Also fold in 10-min data: average each (date, hour) window → one value
+    for dt, ccu in hourly_rows:
+        dow_hour[f"{dt.weekday()}_{dt.hour}"].append(ccu)
+
+    # Fold 10-min data: average each (date, hour) window → one representative value
     tenmin_by_dh: dict[tuple, list[int]] = defaultdict(list)
     for dt, ccu in tenmin_rows:
         tenmin_by_dh[(dt.date(), dt.weekday(), dt.hour)].append(ccu)
-    for (date, dow, hour), vals in tenmin_by_dh.items():
-        key = f"{dow}_{hour}"
-        dow_hour[key].append(round(sum(vals) / len(vals)))
+    for (_, dow, hour), vals in tenmin_by_dh.items():
+        dow_hour[f"{dow}_{hour}"].append(round(sum(vals) / len(vals)))
 
-    # Compute stats per slot
+    # Build slot dicts with _vals list (required by ticker's rolling window update)
     slots: dict[str, dict] = {}
     for key, vals in dow_hour.items():
-        s = compute_slot_stats(vals)
-        if s:
-            slots[key] = s
+        if not vals:
+            continue
+        n   = len(vals)
+        avg = sum(vals) / n
+        std = statistics.stdev(vals) if n > 1 else 0.0
+        cv  = (std / avg * 100) if avg > 0 else 0.0
+        # FIX: include _vals so ticker's record_snapshot can extend the rolling window
+        # without treating the slot as brand-new (seed_n logic uses n to backfill)
+        slots[key] = {
+            "avg":   round(avg, 2),
+            "std":   round(std, 2),
+            "cv":    round(cv,  2),
+            "n":     n,
+            "_vals": vals[-30:],   # keep last 30 as the warm-start rolling window
+        }
 
-    # ── Trend correction ───────────────────────────────────────
-    trend_7d  = compute_trend(daily_rows, 7)   if daily_rows else 0.0
-    trend_30d = compute_trend(daily_rows, 30)  if daily_rows else 0.0
-    # Blend: 70% short-term, 30% medium-term
+    # ── Trend ─────────────────────────────────────────────────
+    trend_7d    = compute_trend(daily_rows,  7) if daily_rows else 0.0
+    trend_30d   = compute_trend(daily_rows, 30) if daily_rows else 0.0
     trend_blend = trend_7d * 0.7 + trend_30d * 0.3
     last_daily  = daily_rows[-1][1] if daily_rows else None
     print(f"  Trend: 7d={trend_7d:+.1f}/day  30d={trend_30d:+.1f}/day  "
           f"blended={trend_blend:+.1f}/day")
 
-    # ── Build tick buffer from 10-min data ────────────────────
-    # Keep last 2016 ticks (~2 weeks at 10-min = enough for same-slot momentum)
+    # ── Tick buffer ────────────────────────────────────────────
     ticks = [{"ts": dt.strftime("%Y-%m-%dT%H:%M"), "ccu": ccu}
              for dt, ccu in tenmin_rows][-2016:]
     if not ticks and hourly_rows:
@@ -127,7 +128,7 @@ def seed_game(game):
 
     # ── ATH ───────────────────────────────────────────────────
     all_ccus = [c for _, c in (daily_rows + hourly_rows + tenmin_rows)]
-    ath = max(max(all_ccus), game["ath_floor"]) if all_ccus else game["ath_floor"]
+    ath      = max(max(all_ccus), game["ath_floor"]) if all_ccus else game["ath_floor"]
 
     # ── Load existing Redis data ──────────────────────────────
     existing = {}
@@ -135,44 +136,75 @@ def seed_game(game):
         raw = redis_get(game["redis_key"])
         if raw:
             existing = json.loads(raw)
-            print(f"  Existing Redis data found (ATH={existing.get('ath'):,})")
+            print(f"  Existing Redis data found (ATH={existing.get('ath', 0):,})")
         else:
             print("  No existing data — writing fresh.")
     except Exception as e:
         print(f"  Warning loading existing: {e}")
 
-    # Merge ticks: CSV first, live ticks at tail
+    # Merge ticks: CSV first, live ticks at tail (deduplicated by ts)
     existing_ticks = existing.get("ticks", [])
     existing_ts    = {t["ts"] for t in existing_ticks}
     merged_ticks   = ([t for t in ticks if t["ts"] not in existing_ts]
                       + existing_ticks)[-2016:]
 
-    merged_ath = max(ath, existing.get("ath", 0))
+    merged_ath    = max(ath, existing.get("ath", 0))
+    merged_ath_ts = existing.get("ath_ts") if existing.get("ath", 0) >= ath else None
 
+    # FIX: preserve learned state across reseeds — only overwrite structural slot data.
+    # signal_weights, bias, slot_errors, pred_log, week_stats, signal_streak
+    # are all the result of live learning and should survive a reseed.
     data = {
+        # Structural — always overwritten from fresh CSV
         "slots":      slots,
         "trend":      round(trend_blend, 3),
         "last_daily": last_daily,
         "ath":        merged_ath,
-        "session":    existing.get("session", {}),
+        "ath_ts":     merged_ath_ts,
         "ticks":      merged_ticks,
-        "seed_ts":    __import__("datetime").datetime.utcnow().date().isoformat(),
+        "seed_ts":    date.today().isoformat(),  # FIX: no more __import__ hack
+
+        # Session — preserve live intraday state
+        "session":    existing.get("session", {}),
+
+        # Learned — preserve across reseeds, reset only if explicitly cleared
+        "signal_weights": existing.get("signal_weights",
+                                       {"baseline": 1.5, "slot": 1.2, "momentum": 0.6}),
+        "bias":           existing.get("bias",         0.0),
+        "slot_errors":    existing.get("slot_errors",  {}),
+        "pred_log":       existing.get("pred_log",     []),
+        "week_stats":     existing.get("week_stats",   {}),
+        "signal_streak":  existing.get("signal_streak",
+                                       {"signal": None, "count": 0}),
     }
 
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))
     print(f"  Done ✓  slots={len(slots)}  ticks={len(merged_ticks)}  ATH={merged_ath:,}")
 
-    # Summary of key slots
+    # ── Slot summary ──────────────────────────────────────────
     days_label = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    print(f"\n  Slot summary (peak hours):")
+
+    # Peak hours per day
+    print(f"\n  Peak hours (top slot per day):")
     for dow in range(7):
-        for hour in [15, 16]:
-            key = f"{dow}_{hour}"
-            s = slots.get(key)
-            if s:
-                print(f"    {days_label[dow]} {hour:02d}:00  "
-                      f"n={s['n']}  avg={s['avg']:7,.0f}  "
-                      f"cv={s['cv']:.1f}%  stddev={s['std']:6,.0f}")
+        day_slots = {h: slots[f"{dow}_{h}"] for h in range(24) if f"{dow}_{h}" in slots}
+        if not day_slots:
+            continue
+        best_h = max(day_slots, key=lambda h: day_slots[h]["avg"])
+        s = day_slots[best_h]
+        print(f"    {days_label[dow]} {best_h:02d}:00  "
+              f"n={s['n']}  avg={s['avg']:7,.0f}  "
+              f"cv={s['cv']:.1f}%  std={s['std']:6,.0f}")
+
+    # Noisiest slots — useful for knowing which signals will be suppressed
+    noisy = [(k, s) for k, s in slots.items() if s["cv"] > 30]
+    if noisy:
+        noisy.sort(key=lambda x: x[1]["cv"], reverse=True)
+        print(f"\n  ⚠️  Noisy slots (cv > 30% — signals will be suppressed):")
+        for k, s in noisy[:8]:
+            d, h = map(int, k.split("_"))
+            print(f"    {days_label[d]} {h:02d}:00  cv={s['cv']:.0f}%  "
+                  f"avg={s['avg']:,.0f}  n={s['n']}")
 
 def main():
     if not REDIS_URL or not REDIS_TOKEN:

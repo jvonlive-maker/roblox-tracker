@@ -462,6 +462,9 @@ def compute_signal(data, ccu, dow, hour):
     pct       = (ccu - curr_avg) / curr_avg * 100
 
     confidence = slot_confidence(data, dh_key, cv)
+    # Hard ceiling — above 30% CV the slot is too noisy to trust regardless of history
+    if cv > 30 and confidence != "Low":
+        confidence = "Low"
 
     trend_up = trend_down = False
     trend_str = "trend unclear"
@@ -598,6 +601,9 @@ def predict_next_tick(data, ccu, now_est, dow):
             confidence = "Medium"
         else:
             confidence = "Low"
+    # Hard CV ceiling — noisy slots can never be High/Medium regardless of other factors
+    if (baseline_cv or 100) > 30 and confidence != "Low":
+        confidence = "Low"
 
     parts = []
     if baseline_delta is not None: parts.append(f"baseline {baseline_delta:+.0f}")
@@ -776,16 +782,21 @@ def run_tick(game):
         pred["confidence"] == "High"
         and pred["predicted_ccu"] is not None
         and pred["std"] is not None
+        and cv_val is not None and cv_val < 20   # hard CV ceiling for SL/TP
         and (
             (se and se["n"] >= 5 and se["mae"] / max(ccu, 1) * 100 < 8)
-            or (cv_val is not None and cv_val < 12)
+            or cv_val < 12
         )
     )
     if use_sl_tp:
         std = pred["std"]
         tp  = round(pred["predicted_ccu"] + 1.0 * std)
         sl  = round(pred["predicted_ccu"] - 1.5 * std)
-        sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
+        sl  = max(sl, 0)   # SL can never be negative
+        if sl == 0 or tp <= ccu:
+            sl_tp_lines = ""   # nonsensical levels, suppress
+        else:
+            sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
         log.info(f"[{game['name']}] SL/TP: sl={sl:,} tp={tp:,}")
 
     mae, dir_pct, n_pred = prediction_accuracy(data)
@@ -835,8 +846,14 @@ def run_tick(game):
     cv_str      = f"  cv {cv_val:.0f}%" if cv_val is not None else ""
 
     # Show bias correction in notification if meaningful
-    bias_val  = data.get("bias", 0.0)
-    bias_note = f"  bias {-bias_val:+.0f}" if abs(bias_val) > 15 else ""
+    bias_val     = data.get("bias", 0.0)
+    bias_pct     = abs(bias_val) / max(ccu, 1) * 100
+    if bias_pct > 20:
+        bias_note = f"  ⚠️ bias {-bias_val:+.0f} (model converging)"
+    elif abs(bias_val) > 15:
+        bias_note = f"  bias {-bias_val:+.0f}"
+    else:
+        bias_note = ""
 
     streak_str = f"  x{streak_count}" if streak_count >= 3 else ""
     sig_line1  = f"{sig_emoji} {sig['signal']}{streak_str}  •  {sig['confidence']}{cv_str}"
@@ -848,7 +865,7 @@ def run_tick(game):
         f"CCU      {ccu:,}\n"
         f"15m      {d_15m}\n"
         f"vs Avg   {d_avg}\n"
-        f"Since ↑  {d_24h}\n"
+        f"Day open {d_24h}\n"
         f"\n"
         f"↑ {state.intraday_high:,}  ↓ {low_display}  •  ATH 🏆 {ath:,}\n"
         f"\n"

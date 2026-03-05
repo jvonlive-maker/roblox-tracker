@@ -25,12 +25,12 @@ GAMES = [
         "csv_base":    "uflu",
     },
     {
-        "name":        "ETFB",
-        "universe_id": "9363735110",
-        "redis_key":   "ccu:etfb",
+        "name":        "ENPT",
+        "universe_id": "324740177",
+        "redis_key":   "ccu:enpt",
         "ntfy_topic":  "",
-        "ath_floor":   3552984,
-        "csv_base":    "etfb",
+        "ath_floor":   5378,
+        "csv_base":    "enpt",
     },
     
 ]

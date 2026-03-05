@@ -166,9 +166,11 @@ def seed_game(game):
     merged_ath    = max(ath, existing.get("ath", 0))
     merged_ath_ts = existing.get("ath_ts") if existing.get("ath", 0) >= ath else None
 
-    # FIX: preserve learned state across reseeds — only overwrite structural slot data.
+    # Preserve learned state across reseeds — only overwrite structural slot data.
     # signal_weights, bias, slot_errors, pred_log, week_stats, signal_streak
     # are all the result of live learning and should survive a reseed.
+    # drift_warned is intentionally RESET on reseed — drift alerts right after
+    # a reseed are always noise since we just refreshed the slot averages.
     data = {
         # Structural — always overwritten from fresh CSV
         "slots":      slots,
@@ -177,12 +179,12 @@ def seed_game(game):
         "ath":        merged_ath,
         "ath_ts":     merged_ath_ts,
         "ticks":      merged_ticks,
-        "seed_ts":    date.today().isoformat(),  # FIX: no more __import__ hack
+        "seed_ts":    date.today().isoformat(),
 
         # Session — preserve live intraday state
         "session":    existing.get("session", {}),
 
-        # Learned — preserve across reseeds, reset only if explicitly cleared
+        # Learned — preserve across reseeds
         "signal_weights": existing.get("signal_weights",
                                        {"baseline": 1.5, "slot": 1.2, "momentum": 0.6}),
         "bias":           existing.get("bias",         0.0),
@@ -191,6 +193,9 @@ def seed_game(game):
         "week_stats":     existing.get("week_stats",   {}),
         "signal_streak":  existing.get("signal_streak",
                                        {"signal": None, "count": 0}),
+
+        # Reset on every reseed — stale drift warnings are irrelevant after fresh data
+        "drift_warned":   {},
     }
 
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))

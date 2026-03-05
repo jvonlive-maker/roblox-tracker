@@ -5,10 +5,22 @@ Multi-game Roblox CCU ticker.
 - Sends alerts to Discord webhook
 - Persists state in Upstash Redis
 - Self-improving: adaptive signal weights, bias correction, per-slot error memory
+
+Fixes:
+  1. LONG/SHORT suppressed to HOLD when cv > 30%
+  2. Peak fallback removed — no more cross-day misleading peak
+  3. last_tick restored unconditionally across restarts
+  4. time_to_peak requires meaningful uplift (PEAK_MIN_UPLIFT_PCT)
+
+Additions:
+  5. Per-slot drift detection — alerts when slot averages lag actuals by >20%
+  6. Confidence calibration report in weekly summary
+  7. Discord spacing — games staggered evenly across the 15-min window
+
 Requires: pip install requests
 """
 
-import json, logging, os, signal, time, statistics, math
+import json, logging, os, signal, time, statistics
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
@@ -54,6 +66,12 @@ def redis_set(key, value, retries=3):
             time.sleep(wait)
     log.error("All Redis SET attempts failed.")
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+CV_NOISE_CEILING    = 30.0   # suppress LONG/SHORT above this CV%
+PEAK_MIN_UPLIFT_PCT = 10.0   # minimum % uplift required to show time-to-peak
+DRIFT_THRESHOLD_PCT = 20.0   # slot avg vs recent actuals % gap to trigger drift alert
+DRIFT_MIN_TICKS     = 8      # need at least this many recent same-slot ticks to check
+
 # ── Data ──────────────────────────────────────────────────────────────────────
 
 def load_data(game):
@@ -61,22 +79,22 @@ def load_data(game):
         raw = redis_get(game["redis_key"])
         if raw:
             data = json.loads(raw)
-            data.setdefault("ath",          game["ath_floor"])
-            data["ath"] = max(data["ath"],  game["ath_floor"])
-            data.setdefault("ath_ts",       None)
-            data.setdefault("slots",        {})
-            data.setdefault("trend",        0.0)
-            data.setdefault("last_daily",   None)
-            data.setdefault("session",      {})
-            data.setdefault("ticks",        [])
-            data.setdefault("pred_log",     [])
-            data.setdefault("week_stats",   {})
-            # Learning state
+            data.setdefault("ath",            game["ath_floor"])
+            data["ath"] = max(data["ath"],    game["ath_floor"])
+            data.setdefault("ath_ts",         None)
+            data.setdefault("slots",          {})
+            data.setdefault("trend",          0.0)
+            data.setdefault("last_daily",     None)
+            data.setdefault("session",        {})
+            data.setdefault("ticks",          [])
+            data.setdefault("pred_log",       [])
+            data.setdefault("week_stats",     {})
             data.setdefault("signal_weights", {"baseline": 1.5, "slot": 1.2, "momentum": 0.6})
-            data.setdefault("bias",           0.0)   # rolling residual correction
-            data.setdefault("slot_errors",    {})    # per dow_hour MAE
-            data.setdefault("seed_ts",        None)  # date of last reseed
-            data.setdefault("signal_streak",  {"signal": None, "count": 0})  # consecutive signal
+            data.setdefault("bias",           0.0)
+            data.setdefault("slot_errors",    {})
+            data.setdefault("seed_ts",        None)
+            data.setdefault("signal_streak",  {"signal": None, "count": 0})
+            data.setdefault("drift_warned",   {})
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -87,6 +105,7 @@ def load_data(game):
         "signal_weights": {"baseline": 1.5, "slot": 1.2, "momentum": 0.6},
         "bias": 0.0, "slot_errors": {},
         "seed_ts": None, "signal_streak": {"signal": None, "count": 0},
+        "drift_warned": {},
     }
 
 def save_data(game, data):
@@ -120,7 +139,7 @@ def record_snapshot(data, game, dow, hour, ccu, now_est):
 
     week_key = now_est.strftime("%Y-W%W")
     ws = data["week_stats"].setdefault(week_key, {
-        "high": ccu, "low": ccu, "sum": 0, "n": 0, "pred_hits": 0, "pred_total": 0
+        "high": ccu, "low": ccu, "sum": 0, "n": 0
     })
     ws["high"] = max(ws["high"], ccu)
     ws["low"]  = min(ws["low"],  ccu)
@@ -142,19 +161,11 @@ def record_prediction(data, now_est, predicted_ccu, confidence, dow, hour, signa
         "confidence":   confidence,
         "actual":       None,
         "dow_hour":     f"{dow}_{hour}",
-        "signals_used": signals_used,   # list of signal names that fired
+        "signals_used": signals_used,
     })
     data["pred_log"] = data["pred_log"][-200:]
 
 def score_last_prediction(data, ccu, now_dow, now_hour):
-    """
-    Score the most recent unscored prediction.
-    Also:
-      1. Update per-slot error memory (slot_errors)
-      2. Update rolling bias (systematic over/under prediction)
-      3. Update adaptive signal weights based on which signals were most accurate
-    Returns the scored entry or None.
-    """
     scored_entry = None
     for entry in reversed(data["pred_log"]):
         if entry["actual"] is None:
@@ -165,11 +176,11 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     if scored_entry is None:
         return None
 
-    error     = scored_entry["predicted"] - ccu   # signed: + = predicted too high
+    error     = scored_entry["predicted"] - ccu
     abs_error = abs(error)
     dh_key    = scored_entry.get("dow_hour", f"{now_dow}_{now_hour}")
 
-    # ── 1. Per-slot error memory ──────────────────────────────
+    # Per-slot error memory
     se = data["slot_errors"].setdefault(dh_key, {"mae": abs_error, "n": 1, "_errs": [abs_error]})
     errs = se.get("_errs", [se["mae"]])
     errs.append(abs_error)
@@ -179,53 +190,48 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     se["mae"]   = sum(errs) / len(errs)
     data["slot_errors"][dh_key] = se
 
-    # ── 2. Rolling bias correction ────────────────────────────
-    # Exponential moving average of signed error (alpha=0.15)
-    # Positive bias = model is consistently predicting too high → subtract next time
+    # Rolling bias (EMA alpha=0.15)
     alpha        = 0.15
     data["bias"] = data["bias"] * (1 - alpha) + error * alpha
 
-    # ── 3. Adaptive signal weights ────────────────────────────
-    # We don't know each signal's individual contribution to the error, but we
-    # track which signal *combination* was used and update weights proportionally.
-    # Simpler heuristic: if error is large and momentum was used, decay momentum
-    # weight slightly. If error is small, boost whichever signals fired.
+    # Adaptive signal weights
     signals_used = scored_entry.get("signals_used", [])
     weights      = data["signal_weights"]
     pct_error    = abs_error / max(ccu, 1) * 100
 
     if pct_error < 5:
-        # Accurate — modestly boost all signals that contributed
         for s in signals_used:
             if s in weights:
                 weights[s] = min(2.5, weights[s] * 1.03)
     elif pct_error > 20:
-        # Inaccurate — decay all signals that contributed
         for s in signals_used:
             if s in weights:
                 weights[s] = max(0.2, weights[s] * 0.95)
 
-    # Renormalise so they don't drift to infinity — keep sum ≈ 3.3 (original sum)
     total = sum(weights.values())
     if total > 0:
-        target = 3.3
-        factor = target / total
+        factor = 3.3 / total
         for k in weights:
             weights[k] = round(weights[k] * factor, 4)
 
     data["signal_weights"] = weights
 
     log.info(f"Scored: pred={scored_entry['predicted']:,} actual={ccu:,} "
-             f"err={error:+,} bias={data['bias']:+.1f} "
-             f"weights={weights}")
+             f"err={error:+,} bias={data['bias']:+.1f} weights={weights}")
     return scored_entry
 
 def prediction_accuracy(data):
+    """
+    Returns (mae, directional_pct, calibration_dict, n).
+    calibration_dict: {tier: mae} per confidence level — used for weekly report.
+    """
     scored = [e for e in data["pred_log"] if e["actual"] is not None]
     if len(scored) < 3:
-        return None, None, 0
+        return None, None, None, 0
+
     errors = [abs(e["predicted"] - e["actual"]) for e in scored]
     mae    = sum(errors) / len(errors)
+
     hits = total = 0
     for i in range(1, len(scored)):
         prev = scored[i-1]["actual"]
@@ -235,35 +241,99 @@ def prediction_accuracy(data):
         if (curr - prev) * (pred - prev) > 0: hits += 1
         total += 1
     directional = (hits / total * 100) if total > 0 else None
-    return mae, directional, len(scored)
+
+    # Per-confidence-tier MAE
+    from collections import defaultdict
+    by_conf = defaultdict(list)
+    for e in scored:
+        by_conf[e.get("confidence", "—")].append(abs(e["predicted"] - e["actual"]))
+    calibration = {k: round(sum(v) / len(v), 1) for k, v in by_conf.items() if v}
+
+    return mae, directional, calibration, len(scored)
 
 def slot_confidence(data, dh_key, cv):
-    """
-    Confidence based on OBSERVED per-slot error history (not just CV).
-    After enough predictions, actual MAE beats CV as a predictor of reliability.
-    Falls back to CV-based if no slot error history yet.
-    """
     se = data["slot_errors"].get(dh_key)
     if se and se["n"] >= 5:
-        # Use actual observed MAE relative to last known avg for this slot
         slot = data["slots"].get(dh_key)
         if slot and slot["avg"] > 0:
             obs_cv = se["mae"] / slot["avg"] * 100
             if   obs_cv < 8:  return "High"
             elif obs_cv < 18: return "Medium"
             else:             return "Low"
-    # Fall back to CV%
     if   cv < 12: return "High"
     elif cv < 22: return "Medium"
     else:         return "Low"
 
-# ── Signal streak tracker ────────────────────────────────────────────────────
+# ── Drift detection ───────────────────────────────────────────────────────────
+
+def check_slot_drift(game, data, dow, hour, now_date):
+    """
+    Compares the slot's stored average against recent actual ticks for the same
+    dow+hour. If stored avg drifts more than DRIFT_THRESHOLD_PCT above recent
+    actuals, predictions will skew high and produce false LONGs.
+
+    Fires a Discord alert at most once per 7 days per slot to avoid spam.
+    """
+    dh_key = f"{dow}_{hour}"
+    slot   = data["slots"].get(dh_key)
+    if not slot or slot["n"] < config.SIGNAL_MIN_SAMPLES:
+        return
+
+    # Gather recent ticks for this exact dow+hour
+    ticks          = data.get("ticks", [])
+    recent_actuals = []
+    for t in ticks:
+        try:
+            t_dt = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        if t_dt.weekday() == dow and t_dt.hour == hour:
+            recent_actuals.append(t["ccu"])
+    recent_actuals = recent_actuals[-DRIFT_MIN_TICKS:]
+
+    if len(recent_actuals) < DRIFT_MIN_TICKS:
+        return
+
+    recent_avg = sum(recent_actuals) / len(recent_actuals)
+    drift_pct  = (slot["avg"] - recent_avg) / max(recent_avg, 1) * 100
+
+    if abs(drift_pct) < DRIFT_THRESHOLD_PCT:
+        return
+
+    # Cooldown — warn at most once per 7 days per slot
+    warned = data.setdefault("drift_warned", {})
+    last_w = warned.get(dh_key)
+    if last_w:
+        try:
+            days_since = (now_date - datetime.fromisoformat(last_w).date()).days
+            if days_since < 7:
+                return
+        except (ValueError, TypeError):
+            pass
+
+    direction  = "above" if drift_pct > 0 else "below"
+    slot_label = f"{DAYS[dow]} {hour:02d}:00"
+
+    msg = (
+        f"Slot avg is {abs(drift_pct):.0f}% {direction} recent actuals.\n"
+        f"\n"
+        f"Slot:          {slot_label}  (n={slot['n']})\n"
+        f"Stored avg:    {int(slot['avg']):,}\n"
+        f"Recent actual: {int(recent_avg):,}  (last {len(recent_actuals)} ticks)\n"
+        f"\n"
+        + ("Predictions skewing high — false LONGs likely.\n" if drift_pct > 0
+           else "Predictions skewing low — false SHORTs likely.\n")
+        + f"Consider reseeding: `python3 seed_redis.py && python3 backtest.py`"
+    )
+    notify(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
+    warned[dh_key]       = now_date.isoformat()
+    data["drift_warned"] = warned
+    log.warning(f"[{game['name']}] Drift: {slot_label} avg={slot['avg']:.0f} "
+                f"recent={recent_avg:.0f} drift={drift_pct:+.1f}%")
+
+# ── Signal streak tracker ─────────────────────────────────────────────────────
 
 def update_streak(data, signal):
-    """
-    Track consecutive ticks with the same signal.
-    Returns (signal, count) — count>=3 means sustained signal.
-    """
     streak = data.setdefault("signal_streak", {"signal": None, "count": 0})
     if streak["signal"] == signal and signal not in ("HOLD", "INSUFFICIENT DATA"):
         streak["count"] += 1
@@ -280,35 +350,40 @@ def update_streak(data, signal):
 
 def time_to_peak(data, now_est):
     """
-    Returns string like 'Peak in ~2h 15m (Fri 4:00 PM  avg 7,140)'.
-    Looks at all remaining slots today and finds the highest average one.
-    Returns None if already at/past today's peak or no slot data.
+    Today's peak ETA only. No cross-day fallback.
+    Requires PEAK_MIN_UPLIFT_PCT above current slot to avoid trivial results.
     """
     if not data["slots"]:
         return None
     dow      = now_est.weekday()
     now_mins = now_est.hour * 60 + now_est.minute
 
+    curr_slot = data["slots"].get(f"{dow}_{now_est.hour}")
+    curr_avg  = curr_slot["avg"] if curr_slot else 0
+
     best_avg  = -1
     best_hour = -1
-    for h in range(now_est.hour + 1, 24):   # only future hours
+    for h in range(now_est.hour + 1, 24):
         slot = data["slots"].get(f"{dow}_{h}")
         if slot and slot["avg"] > best_avg:
             best_avg  = slot["avg"]
             best_hour = h
 
     if best_hour == -1:
-        return None   # past peak for today
+        return None
 
-    # Check it's actually higher than current slot
-    curr_slot = data["slots"].get(f"{dow}_{now_est.hour}")
-    if curr_slot and best_avg <= curr_slot["avg"] * 1.05:
-        return None   # already near peak, not worth showing
+    if curr_avg > 0 and (best_avg - curr_avg) / curr_avg * 100 < PEAK_MIN_UPLIFT_PCT:
+        return None
 
-    delta_m  = best_hour * 60 - now_mins
+    delta_m   = best_hour * 60 - now_mins
     hrs, mins = divmod(delta_m, 60)
-    peak_fmt = now_est.replace(hour=best_hour, minute=0).strftime("%-I:%M %p")
-    eta      = f"~{hrs}h {mins}m" if hrs > 0 and mins else (f"~{hrs}h" if hrs else f"~{mins}m")
+    peak_fmt  = now_est.replace(hour=best_hour, minute=0).strftime("%-I:%M %p")
+    if hrs > 0 and mins:
+        eta = f"~{hrs}h {mins}m"
+    elif hrs:
+        eta = f"~{hrs}h"
+    else:
+        eta = f"~{mins}m"
 
     return f"Peak in {eta}  ({DAYS[dow]} {peak_fmt}  avg {int(best_avg):,})"
 
@@ -317,10 +392,6 @@ def time_to_peak(data, now_est):
 RESEED_DAYS = 45
 
 def check_reseed_reminder(game, data):
-    """
-    Sends a Discord alert if seed data is older than RESEED_DAYS.
-    Only fires once per 30 days so it doesn't spam.
-    """
     seed_ts = data.get("seed_ts")
     if not seed_ts:
         return
@@ -346,10 +417,10 @@ def check_reseed_reminder(game, data):
         f"Seed data is {age_days} days old — slot averages may be drifting.\n"
         f"\n"
         f"Download fresh CSVs from Rolimons and run:\n"
-        f"`python3 clear_redis.py && python3 seed_redis.py`\n"
+        f"`python3 seed_redis.py && python3 backtest.py`\n"
         f"then redeploy."
     )
-    notify(game, f"\u26a0\ufe0f {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})
+    notify(game, f"⚠️ {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})
     data["reseed_warned"] = now_date.isoformat()
     log.info(f"[{game['name']}] Reseed reminder sent (age={age_days}d)")
 
@@ -373,12 +444,15 @@ def get_state(game):
     return _game_states[k]
 
 def restore_state(game, data):
-    state = get_state(game)
-    s     = data.get("session", {})
-    state.last_tick    = s.get("last_tick")
-    state.midnight_ccu = s.get("midnight_ccu")
+    state     = get_state(game)
+    s         = data.get("session", {})
     now_est   = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     today_str = now_est.date().isoformat()
+
+    # Always restore last_tick and midnight_ccu regardless of date
+    state.midnight_ccu = s.get("midnight_ccu")
+    state.last_tick    = s.get("last_tick")
+
     if s.get("last_date") == today_str:
         state.last_date      = now_est.date()
         state.intraday_high  = s.get("intraday_high", 0)
@@ -389,7 +463,11 @@ def restore_state(game, data):
         prev = f"{state.last_tick:,}" if state.last_tick else "none"
         log.info(f"[{game['name']}] Resumed — last CCU: {prev}")
     else:
-        log.info(f"[{game['name']}] New day — intraday reset")
+        state.intraday_high  = 0
+        state.intraday_low   = None
+        state.intraday_sum   = 0
+        state.intraday_ticks = 0
+        log.info(f"[{game['name']}] New day — intraday reset (last_tick kept)")
 
 def persist_state(game, data, now_est):
     state = get_state(game)
@@ -415,13 +493,6 @@ def diff_label(current, historical):
 
 def get_slot(data, dow, hour):
     return data["slots"].get(f"{dow}_{hour % 24}")
-
-def peak_slot(data):
-    best_key = max(data["slots"], key=lambda k: data["slots"][k]["avg"], default=None)
-    if not best_key:
-        return None
-    dow, hour = map(int, best_key.split("_"))
-    return DAYS[dow], hour, data["slots"][best_key]["avg"]
 
 # ── Signal engine ─────────────────────────────────────────────────────────────
 
@@ -462,8 +533,7 @@ def compute_signal(data, ccu, dow, hour):
     pct       = (ccu - curr_avg) / curr_avg * 100
 
     confidence = slot_confidence(data, dh_key, cv)
-    # Hard ceiling — above 30% CV the slot is too noisy to trust regardless of history
-    if cv > 30 and confidence != "Low":
+    if cv > CV_NOISE_CEILING:
         confidence = "Low"
 
     trend_up = trend_down = False
@@ -483,7 +553,6 @@ def compute_signal(data, ccu, dow, hour):
             elif d1 < -config.SIGNAL_TREND_PCT: trend_down = True; trend_str = f"avg falls {d1:.1f}% next hr"
             else: trend_str = f"flat next hr ({d1:+.1f}%)"
 
-    # If CCU is >45% below adj avg it's structural decline, not a dip — never LONG
     extreme_decline = pct < -45
 
     if   pct < -config.SIGNAL_LONG_PCT and trend_up and not extreme_decline:
@@ -496,6 +565,12 @@ def compute_signal(data, ccu, dow, hour):
         signal = "HOLD";  reasoning = f"+{pct:.1f}% above avg but {trend_str}"
     else:
         signal = "HOLD";  reasoning = f"{pct:+.1f}% vs adj. avg — {trend_str}"
+
+    # Suppress LONG/SHORT when slot is too noisy
+    if cv > CV_NOISE_CEILING and signal in ("LONG", "SHORT"):
+        log.info(f"[signal suppressed] {signal} → HOLD (cv={cv:.1f}% > {CV_NOISE_CEILING}%)")
+        signal    = "HOLD"
+        reasoning = f"Signal suppressed — cv {cv:.0f}% exceeds noise threshold ({CV_NOISE_CEILING:.0f}%)"
 
     return {
         "signal": signal, "confidence": confidence, "reasoning": reasoning,
@@ -511,7 +586,6 @@ def predict_next_tick(data, ccu, now_est, dow):
     ticks  = data.get("ticks", [])
     dh_key = f"{dow}_{hour}"
 
-    # Adaptive weights learned from prediction history
     weights_cfg = data.get("signal_weights", {"baseline": 1.5, "slot": 1.2, "momentum": 0.6})
 
     curr_slot = get_slot(data, dow, hour)
@@ -530,7 +604,6 @@ def predict_next_tick(data, ccu, now_est, dow):
     if len(ticks) >= 3:
         recent = ticks[-3:]
         deltas = [recent[i+1]["ccu"] - recent[i]["ccu"] for i in range(len(recent)-1)]
-        # Weight most recent move heavier
         momentum_delta = deltas[0] * 0.4 + deltas[1] * 0.6
 
     slot_deltas_list = []
@@ -551,7 +624,6 @@ def predict_next_tick(data, ccu, now_est, dow):
     signals_used = []
 
     if baseline_delta is not None:
-        # Scale baseline weight by inverse CV (low volatility = trust more)
         cv_factor = max(0.1, 1.0 - (baseline_cv or 50) / 100)
         signals.append(baseline_delta)
         weights.append(weights_cfg["baseline"] * cv_factor)
@@ -573,20 +645,14 @@ def predict_next_tick(data, ccu, now_est, dow):
                 "confidence": "—", "detail": "insufficient data",
                 "std": None, "signals_used": []}
 
-    total_w = sum(weights)
-    delta   = sum(s * w for s, w in zip(signals, weights)) / total_w
+    total_w    = sum(weights)
+    delta      = sum(s * w for s, w in zip(signals, weights)) / total_w
+    bias       = data.get("bias", 0.0)
+    delta_corr = delta - bias
+    predicted  = round(ccu + delta_corr)
+    delta_int  = predicted - ccu
+    delta_pct  = delta_corr / ccu * 100 if ccu else 0
 
-    # ── Bias correction ───────────────────────────────────────
-    # Subtract the rolling signed error so systematic drift is removed
-    bias        = data.get("bias", 0.0)
-    delta_corr  = delta - bias
-    bias_str    = f" bias_corr={-bias:+.0f}" if abs(bias) > 10 else ""
-
-    predicted = round(ccu + delta_corr)
-    delta_int = predicted - ccu
-    delta_pct = delta_corr / ccu * 100 if ccu else 0
-
-    # Confidence: use observed slot MAE if available, else signal count + CV
     se = data["slot_errors"].get(dh_key)
     if se and se["n"] >= 5:
         obs_cv = se["mae"] / max(ccu, 1) * 100
@@ -601,8 +667,7 @@ def predict_next_tick(data, ccu, now_est, dow):
             confidence = "Medium"
         else:
             confidence = "Low"
-    # Hard CV ceiling — noisy slots can never be High/Medium regardless of other factors
-    if (baseline_cv or 100) > 30 and confidence != "Low":
+    if (baseline_cv or 100) > CV_NOISE_CEILING and confidence != "Low":
         confidence = "Low"
 
     parts = []
@@ -682,19 +747,31 @@ def send_weekly_summary(game, data):
         return
 
     avg = ws["sum"] // ws["n"]
-    mae, dir_pct, n_pred = prediction_accuracy(data)
-    pk = peak_slot(data)
-    w  = data.get("signal_weights", {})
+    mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
+    w = data.get("signal_weights", {})
 
     acc_str  = f"\nPred  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
-    peak_str = f"\nPeak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}" if pk else ""
     w_str    = (f"\nWeights  base {w.get('baseline',0):.2f}  "
                 f"slot {w.get('slot',0):.2f}  "
                 f"mom {w.get('momentum',0):.2f}") if w else ""
     bias_str = f"\nBias correction  {-data.get('bias',0):+.0f} CCU" if abs(data.get("bias",0)) > 5 else ""
 
+    # Confidence calibration block
+    cal_str = ""
+    if calibration:
+        parts = []
+        for tier in ("High", "Medium", "Low"):
+            if tier in calibration:
+                parts.append(f"{tier} {calibration[tier]:.0f}")
+        if parts:
+            cal_str = "\nConf MAE  " + "  |  ".join(parts)
+        h_mae = calibration.get("High")
+        l_mae = calibration.get("Low")
+        if h_mae and l_mae and h_mae >= l_mae * 0.9:
+            cal_str += "\n⚠️ Conf tiers miscalibrated — thresholds may need tuning"
+
     msg = (f"↑ {ws['high']:,}  ↓ {ws['low']:,}  avg {avg:,}"
-           f"{acc_str}{peak_str}{w_str}{bias_str}")
+           f"{acc_str}{cal_str}{w_str}{bias_str}")
     notify(game, f"📊 {game['name']} — Weekly Summary", msg, {"signal": "HOLD"})
     log.info(f"[{game['name']}] Weekly summary sent.")
 
@@ -754,8 +831,7 @@ def run_tick(game):
     sig          = compute_signal(data, ccu, dow, now_est.hour)
     sig_emoji    = SIGNAL_EMOJI.get(sig["signal"], "⚪")
     cv_val       = sig.get("cv")
-    # Only track streaks for High/Medium confidence — Low is too noisy
-    streak_input  = sig["signal"] if sig.get("confidence") in ("High", "Medium") else "HOLD"
+    streak_input = sig["signal"] if sig.get("confidence") in ("High", "Medium") else "HOLD"
     streak_sig, streak_count = update_streak(data, streak_input)
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "
              + (f"cv={cv_val:.1f}% — " if cv_val else "— ")
@@ -774,7 +850,7 @@ def run_tick(game):
     else:
         pred_str = "—"
 
-    # Stop loss / take profit — High confidence + low observed error
+    # Stop loss / take profit
     sl_tp_lines = ""
     dh_key = f"{dow}_{now_est.hour}"
     se     = data["slot_errors"].get(dh_key)
@@ -782,7 +858,7 @@ def run_tick(game):
         pred["confidence"] == "High"
         and pred["predicted_ccu"] is not None
         and pred["std"] is not None
-        and cv_val is not None and cv_val < 20   # hard CV ceiling for SL/TP
+        and cv_val is not None and cv_val < 20
         and (
             (se and se["n"] >= 5 and se["mae"] / max(ccu, 1) * 100 < 8)
             or cv_val < 12
@@ -792,14 +868,13 @@ def run_tick(game):
         std = pred["std"]
         tp  = round(pred["predicted_ccu"] + 1.0 * std)
         sl  = round(pred["predicted_ccu"] - 1.5 * std)
-        sl  = max(sl, 0)   # SL can never be negative
+        sl  = max(sl, 0)
         if sl == 0 or tp <= ccu:
-            sl_tp_lines = ""   # nonsensical levels, suppress
+            sl_tp_lines = ""
         else:
             sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
-        log.info(f"[{game['name']}] SL/TP: sl={sl:,} tp={tp:,}")
 
-    mae, dir_pct, n_pred = prediction_accuracy(data)
+    mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
     acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
 
     forecast_parts = []
@@ -807,18 +882,13 @@ def run_tick(game):
     if sig["next2_avg"]: forecast_parts.append(f"{int(sig['next2_avg']):,}")
     forecast_str = " → ".join(forecast_parts) if forecast_parts else "—"
 
-    event_label  = detect_event(data, ccu, dow, now_est.hour, pct_15m)
-    ttp_str      = time_to_peak(data, now_est)
-    check_reseed_reminder(game, data)
+    event_label = detect_event(data, ccu, dow, now_est.hour, pct_15m)
+    ttp_str     = time_to_peak(data, now_est)
+    peak_str    = ttp_str if ttp_str else ""
 
-    pk = peak_slot(data)
-    # Use time-to-peak if available (more useful), fall back to static peak slot
-    if ttp_str:
-        peak_str = ttp_str   # already has day/time/avg
-    elif pk:
-        peak_str = f"Peak  {pk[0]} {int(pk[1]):02d}:00  avg {int(pk[2]):,}"
-    else:
-        peak_str = ""
+    # Drift detection — runs after snapshot so slot avg reflects latest tick
+    check_slot_drift(game, data, dow, now_est.hour, today)
+    check_reseed_reminder(game, data)
 
     if is_new_ath:
         prev_ath  = game["ath_floor"]
@@ -835,7 +905,7 @@ def run_tick(game):
     else:
         title = f"{game['name']} • {DAYS[dow]} {now_est.strftime('%-I:%M %p')}  {ccu:,}"
 
-    if event_label:           trend = event_label
+    if event_label:                      trend = event_label
     elif pct_avg >  config.BREAKOUT_PCT: trend = "🔥 BREAKOUT"
     elif pct_avg < -config.DROP_AVG_PCT: trend = "📉 BELOW AVG"
     else:                                trend = "⚖️ Stable"
@@ -845,9 +915,8 @@ def run_tick(game):
     pct_str     = f"{(ccu-sig['curr_avg'])/sig['curr_avg']*100:+.1f}%" if sig["curr_avg"] else ""
     cv_str      = f"  cv {cv_val:.0f}%" if cv_val is not None else ""
 
-    # Show bias correction in notification if meaningful
-    bias_val     = data.get("bias", 0.0)
-    bias_pct     = abs(bias_val) / max(ccu, 1) * 100
+    bias_val  = data.get("bias", 0.0)
+    bias_pct  = abs(bias_val) / max(ccu, 1) * 100
     if bias_pct > 20:
         bias_note = f"  ⚠️ bias {-bias_val:+.0f} (model converging)"
     elif abs(bias_val) > 15:
@@ -857,7 +926,7 @@ def run_tick(game):
 
     streak_str = f"  x{streak_count}" if streak_count >= 3 else ""
     sig_line1  = f"{sig_emoji} {sig['signal']}{streak_str}  •  {sig['confidence']}{cv_str}"
-    sig_line2 = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
+    sig_line2  = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
 
     message = (
         f"{trend}  •  {DAYS[dow]} {time_label}\n"
@@ -906,18 +975,31 @@ if __name__ == "__main__":
     log.info(f"Redis: {REDIS_URL[:40]}...")
     log.info(f"Discord: {'enabled' if config.DISCORD_WEBHOOK else 'disabled'}")
 
+    # ── Discord spacing ───────────────────────────────────────────────────────
+    # Spread game ticks evenly across the 15-min window so embeds land
+    # separately in Discord instead of arriving in a burst.
+    # e.g. 3 games → game 0 fires immediately, game 1 after 5s, game 2 after 10s.
+    # Gap is capped at 60s so ticks don't drift far from the quarter-hour mark.
+    n_games  = len(config.GAMES)
+    gap_secs = min(60, 900 // (n_games + 1)) if n_games > 1 else 0
+    log.info(f"Games: {n_games}  |  Discord gap: {gap_secs}s between each")
+
     while not _shutdown:
         wait = seconds_until_next_quarter()
-        log.info(f"Syncing — next tick in {wait}s")
+        log.info(f"Next tick in {wait}s")
         for _ in range(wait):
             if _shutdown: break
             time.sleep(1)
+
         if not _shutdown:
-            for game in config.GAMES:
+            for i, game in enumerate(config.GAMES):
+                if _shutdown: break
+                if i > 0 and gap_secs > 0:
+                    log.info(f"Spacing {gap_secs}s → {game['name']}")
+                    time.sleep(gap_secs)
                 try:
                     run_tick(game)
                 except Exception as e:
                     log.error(f"[{game['name']}] Unhandled error: {e}", exc_info=True)
-            time.sleep(5)
 
     log.info("Ticker stopped cleanly.")

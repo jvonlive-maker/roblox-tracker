@@ -5,8 +5,15 @@ Seeds ALL games in config.GAMES using all available CSV tiers:
   - <game>_hourly.csv  — dow x hour baseline (1 month hourly)
   - <game>_10min.csv   — recent momentum / intra-hour shape (1 week 10-min)
 
+Then automatically runs backtest to learn weights, bias, and slot errors
+on top of the freshly seeded data — no need to run backtest.py separately.
+
 Run once before starting the ticker:
   UPSTASH_REDIS_REST_URL=x UPSTASH_REDIS_REST_TOKEN=y python3 seed_redis.py
+
+Optional flags:
+  --game FF2   only seed + backtest one game
+  --seed-only  skip backtest (seed only)
 """
 
 import csv, json, os, sys, statistics
@@ -16,6 +23,14 @@ from urllib.parse import quote
 
 import requests
 import config
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+seed_only   = "--seed-only" in sys.argv
+filter_game = None
+if "--game" in sys.argv:
+    idx = sys.argv.index("--game")
+    if idx + 1 < len(sys.argv):
+        filter_game = sys.argv[idx + 1].upper()
 
 REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL",   "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
@@ -210,9 +225,31 @@ def main():
     if not REDIS_URL or not REDIS_TOKEN:
         print("ERROR: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN")
         sys.exit(1)
-    print(f"Seeding {len(config.GAMES)} game(s)...")
-    for game in config.GAMES:
+
+    games = [g for g in config.GAMES
+             if filter_game is None or g["name"].upper() == filter_game]
+
+    if not games:
+        print(f"ERROR: no matching game for --game {filter_game}")
+        sys.exit(1)
+
+    print(f"Seeding {len(games)} game(s)...")
+    for game in games:
         seed_game(game)
+
+    if seed_only:
+        print(f"\nSeed complete (backtest skipped). Start with: python3 ticker.py")
+        return
+
+    # Auto-run backtest on top of freshly seeded data
+    print(f"\n{'='*55}")
+    print(f"Seed complete — running backtest to learn weights & bias...")
+    print(f"{'='*55}")
+
+    from backtest import backtest_game
+    for game in games:
+        backtest_game(game)
+
     print(f"\nAll done. Start with: python3 ticker.py")
 
 if __name__ == "__main__":

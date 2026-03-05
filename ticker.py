@@ -15,7 +15,7 @@ Fixes:
 Additions:
   5. Per-slot drift detection — alerts when slot averages lag actuals by >20%
   6. Confidence calibration report in weekly summary
-  7. Discord spacing — games staggered evenly across the 15-min window
+  7. Discord spacer — zero-width space message between each game's embed
 
 Requires: pip install requests
 """
@@ -221,10 +221,7 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     return scored_entry
 
 def prediction_accuracy(data):
-    """
-    Returns (mae, directional_pct, calibration_dict, n).
-    calibration_dict: {tier: mae} per confidence level — used for weekly report.
-    """
+    """Returns (mae, directional_pct, calibration_dict, n)."""
     scored = [e for e in data["pred_log"] if e["actual"] is not None]
     if len(scored) < 3:
         return None, None, None, 0
@@ -242,7 +239,6 @@ def prediction_accuracy(data):
         total += 1
     directional = (hits / total * 100) if total > 0 else None
 
-    # Per-confidence-tier MAE
     from collections import defaultdict
     by_conf = defaultdict(list)
     for e in scored:
@@ -268,18 +264,14 @@ def slot_confidence(data, dh_key, cv):
 
 def check_slot_drift(game, data, dow, hour, now_date):
     """
-    Compares the slot's stored average against recent actual ticks for the same
-    dow+hour. If stored avg drifts more than DRIFT_THRESHOLD_PCT above recent
-    actuals, predictions will skew high and produce false LONGs.
-
-    Fires a Discord alert at most once per 7 days per slot to avoid spam.
+    Compares stored slot avg against recent actual ticks for the same dow+hour.
+    Fires a Discord alert at most once per 7 days per slot.
     """
     dh_key = f"{dow}_{hour}"
     slot   = data["slots"].get(dh_key)
     if not slot or slot["n"] < config.SIGNAL_MIN_SAMPLES:
         return
 
-    # Gather recent ticks for this exact dow+hour
     ticks          = data.get("ticks", [])
     recent_actuals = []
     for t in ticks:
@@ -300,7 +292,6 @@ def check_slot_drift(game, data, dow, hour, now_date):
     if abs(drift_pct) < DRIFT_THRESHOLD_PCT:
         return
 
-    # Cooldown — warn at most once per 7 days per slot
     warned = data.setdefault("drift_warned", {})
     last_w = warned.get(dh_key)
     if last_w:
@@ -349,10 +340,7 @@ def update_streak(data, signal):
 # ── Time-to-peak ──────────────────────────────────────────────────────────────
 
 def time_to_peak(data, now_est):
-    """
-    Today's peak ETA only. No cross-day fallback.
-    Requires PEAK_MIN_UPLIFT_PCT above current slot to avoid trivial results.
-    """
+    """Today's peak ETA only. No cross-day fallback."""
     if not data["slots"]:
         return None
     dow      = now_est.weekday()
@@ -719,6 +707,23 @@ def send_discord(game, title, message, sig, retries=3):
                 log.error(f"[{game['name']}] Discord failed: {e}"); return
             time.sleep(2**attempt)
 
+def send_spacer():
+    """Send a zero-width space message to create visual gap between game embeds."""
+    webhook = config.DISCORD_WEBHOOK
+    if not webhook:
+        return
+    payload = json.dumps({"content": "\u200b"})
+    try:
+        r = http.post(webhook, data=payload,
+                      headers={"Content-Type": "application/json"}, timeout=10)
+        if r.status_code == 429:
+            time.sleep(r.json().get("retry_after", 2))
+            http.post(webhook, data=payload,
+                      headers={"Content-Type": "application/json"}, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.warning(f"Spacer failed: {e}")
+
 def notify(game, title, message, sig):
     send_discord(game, title, message, sig)
 
@@ -756,7 +761,6 @@ def send_weekly_summary(game, data):
                 f"mom {w.get('momentum',0):.2f}") if w else ""
     bias_str = f"\nBias correction  {-data.get('bias',0):+.0f} CCU" if abs(data.get("bias",0)) > 5 else ""
 
-    # Confidence calibration block
     cal_str = ""
     if calibration:
         parts = []
@@ -886,7 +890,6 @@ def run_tick(game):
     ttp_str     = time_to_peak(data, now_est)
     peak_str    = ttp_str if ttp_str else ""
 
-    # Drift detection — runs after snapshot so slot avg reflects latest tick
     check_slot_drift(game, data, dow, now_est.hour, today)
     check_reseed_reminder(game, data)
 
@@ -974,15 +977,7 @@ if __name__ == "__main__":
 
     log.info(f"Redis: {REDIS_URL[:40]}...")
     log.info(f"Discord: {'enabled' if config.DISCORD_WEBHOOK else 'disabled'}")
-
-    # ── Discord spacing ───────────────────────────────────────────────────────
-    # Spread game ticks evenly across the 15-min window so embeds land
-    # separately in Discord instead of arriving in a burst.
-    # e.g. 3 games → game 0 fires immediately, game 1 after 5s, game 2 after 10s.
-    # Gap is capped at 60s so ticks don't drift far from the quarter-hour mark.
-    n_games  = len(config.GAMES)
-    gap_secs = min(60, 900 // (n_games + 1)) if n_games > 1 else 0
-    log.info(f"Games: {n_games}  |  Discord gap: {gap_secs}s between each")
+    log.info(f"Games: {len(config.GAMES)}  |  Spacer between embeds: enabled")
 
     while not _shutdown:
         wait = seconds_until_next_quarter()
@@ -994,11 +989,11 @@ if __name__ == "__main__":
         if not _shutdown:
             for i, game in enumerate(config.GAMES):
                 if _shutdown: break
-                if i > 0 and gap_secs > 0:
-                    log.info(f"Spacing {gap_secs}s → {game['name']}")
-                    time.sleep(gap_secs)
                 try:
                     run_tick(game)
+                    # Send spacer after every game except the last
+                    if i < len(config.GAMES) - 1:
+                        send_spacer()
                 except Exception as e:
                     log.error(f"[{game['name']}] Unhandled error: {e}", exc_info=True)
 

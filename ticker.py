@@ -314,7 +314,7 @@ def check_slot_drift(game, data, dow, hour, now_date):
         f"\n"
         + ("Predictions skewing high — false LONGs likely.\n" if drift_pct > 0
            else "Predictions skewing low — false SHORTs likely.\n")
-        + f"Consider reseeding: `python3 seed_redis.py && python3 backtest.py`"
+        + f"Consider reseeding: `python3 seed_redis.py`"
     )
     notify(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
     warned[dh_key]       = now_date.isoformat()
@@ -405,7 +405,7 @@ def check_reseed_reminder(game, data):
         f"Seed data is {age_days} days old — slot averages may be drifting.\n"
         f"\n"
         f"Download fresh CSVs from Rolimons and run:\n"
-        f"`python3 seed_redis.py && python3 backtest.py`\n"
+        f"`python3 seed_redis.py`\n"
         f"then redeploy."
     )
     notify(game, f"⚠️ {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})

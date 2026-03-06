@@ -32,6 +32,14 @@ GAMES = [
         "ath_floor":   5378,
         "csv_base":    "enpt",
     },
+    {
+        "name":        "FLSV",
+        "universe_id": "3747388906",
+        "redis_key":   "ccu:flsv",
+        "ntfy_topic":  "",
+        "ath_floor":   7348,
+        "csv_base":    "flsv",
+    },
     
 ]
 

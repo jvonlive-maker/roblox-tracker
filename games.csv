@@ -1,0 +1,7 @@
+name,universe_id,ath_floor,csv_base,watchlist
+# ── Watchlist (full tracking) ─────────────────────────────────────────────────
+FF2,3150475059,47636,ff2,true
+UFLU,184199275,49793,uflu,true
+ENPT,324740177,5378,enpt,true
+# ── Scanner games (add all 102 below) ────────────────────────────────────────
+ACC,9362896961,50507,acc,false

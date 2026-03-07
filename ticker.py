@@ -99,6 +99,7 @@ def load_data(game):
             data.setdefault("signal_streak",  {"signal": None, "count": 0})
             data.setdefault("drift_warned",   {})
             data.setdefault("trend_state",    {})
+            data.setdefault("holt_state",     {})
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -1131,6 +1132,69 @@ def send_daily_summary(game, data):
 
 # ── Main tick ─────────────────────────────────────────────────────────────────
 
+# ── Simulated price (Holt exponential smoothing, calibrated per game) ─────────
+#
+# Each game can carry these optional config keys (from elasticity_finder.lua):
+#   sim_base_price   — average price at average CCU (from finder)
+#   sim_elasticity   — CCU elasticity coefficient   (from finder, often ~0 for FF2)
+#   sim_holt_alpha   — Holt level smoothing (default 0.3)
+#   sim_holt_beta    — Holt trend smoothing (default 0.1)
+#
+# Holt state (level + trend) is persisted in Redis under data["holt_state"]
+# and auto-advances each tick — no login required between calibrations.
+# Recalibrate by re-running elasticity_finder.lua and pasting fresh values.
+
+def calc_sim_price(game, data, ccu):
+    base  = game.get("sim_base_price")
+    if base is None:
+        return None, None  # game not configured
+
+    elasticity = game.get("sim_elasticity", 0.0)
+    alpha      = game.get("sim_holt_alpha",  0.3)
+    beta       = game.get("sim_holt_beta",   0.1)
+
+    # CCU adjustment factor
+    avg_ccu = None
+    slots   = data.get("slots", {})
+    if slots:
+        avgs = [s["avg"] for s in slots.values() if s.get("n", 0) >= 3 and s.get("avg", 0) > 0]
+        if avgs:
+            avg_ccu = sum(avgs) / len(avgs)
+    if avg_ccu and avg_ccu > 0 and elasticity != 0:
+        ccu_factor = (ccu / avg_ccu) ** elasticity
+    else:
+        ccu_factor = 1.0
+
+    # Holt level + trend — persisted in Redis
+    hs    = data.setdefault("holt_state", {})
+    level = hs.get("level")
+    trend = hs.get("trend", 0.0)
+
+    # Bootstrap: first time, seed level from base price
+    if level is None:
+        level = base
+        trend = 0.0
+
+    # Holt update: new observation is base * ccu_factor (CCU-adjusted base)
+    obs    = base * ccu_factor
+    l_new  = alpha * obs + (1 - alpha) * (level + trend)
+    t_new  = beta  * (l_new - level) + (1 - beta) * trend
+
+    hs["level"] = l_new
+    hs["trend"] = t_new
+    data["holt_state"] = hs
+
+    # Predicted price = level + one step of trend
+    predicted = round(l_new + t_new, 2)
+
+    # % vs base
+    pct_vs_base = (predicted - base) / base * 100
+    sign = "+" if pct_vs_base >= 0 else ""
+    sim_str = f"~{predicted:.2f}  ({sign}{pct_vs_base:.1f}% vs base {base:.2f})  *(approx)*"
+
+    return predicted, sim_str
+
+
 def run_tick(game):
     now_est = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     dow     = now_est.weekday()
@@ -1248,6 +1312,9 @@ def run_tick(game):
     # ── Trend analysis — runs after snapshot, before save ─────────────────────
     run_trend_analysis(game, data, ccu, dow, now_est.hour, now_est)
 
+    # ── Simulated price ───────────────────────────────────────────────────────
+    _sim_price, sim_price_str = calc_sim_price(game, data, ccu)
+
     if is_new_ath:
         prev_ath  = game["ath_floor"]
         pct_above = (ccu - prev_ath) / prev_ath * 100 if prev_ath else 0
@@ -1295,7 +1362,8 @@ def run_tick(game):
         f"Day open {d_24h}\n"
         f"\n"
         f"↑ {state.intraday_high:,}  ↓ {low_display}  •  ATH 🏆 {ath:,}\n"
-        f"\n"
+        + (f"💰 Sim price  {sim_price_str}\n" if sim_price_str else "")
+        + f"\n"
         f"{sig_line1}\n"
         f"{sig_line2}\n"
         f"Next tick  {pred_str}{bias_note}"

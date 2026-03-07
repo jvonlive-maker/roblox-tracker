@@ -48,13 +48,13 @@ GAMES = [
         "ath_floor":   5378,
         "csv_base":    "enpt",
         # sim price — from elasticity_finder.lua (Rev R²=0.879)
-        "sim_base_price": 10.24,
-        "sim_elasticity": -0.1760,
+        "sim_base_price": 10.03,
+        "sim_elasticity": 0.0218,
         "sim_best_model": "rev",
-        "sim_rev_alpha": 0.0500,
+        "sim_rev_alpha": 0.2000,
         "sim_ema_alpha": 0.0500,
-        "sim_price_std": 0.0824,
-        "sim_ci95": 0.1614,
+        "sim_price_std": 0.0805,
+        "sim_ci95": 0.1578,
     },
     {
         "name":        "FLSV",

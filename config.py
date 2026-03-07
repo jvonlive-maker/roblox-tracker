@@ -16,11 +16,13 @@ GAMES = [
         "ath_floor":   47636,
         "csv_base":    "ff2",
         # sim price — calibrate with elasticity_finder.lua, recalibrate every few days
-        "sim_base_price":  133.84,
-        "sim_elasticity":  -0.3887,
-        "sim_best_model":  "holt",   # Holt was best for FF2
-        "sim_holt_alpha":  0.3,
-        "sim_holt_beta":   0.1,
+        "sim_base_price": 133.64,
+        "sim_elasticity": -0.0105,
+        "sim_best_model": "rev",
+        "sim_rev_alpha": 0.0500,
+        "sim_ema_alpha": 0.3000,
+        "sim_price_std": 1.0566,
+        "sim_ci95": 2.0709,
     },
     {
         "name":        "UFLU",
@@ -30,11 +32,13 @@ GAMES = [
         "ath_floor":   49793,
         "csv_base":    "uflu",
         # sim price — run elasticity_finder.lua on UFLU and paste values here
-        "sim_base_price": 285.65,
-        "sim_elasticity": 0.4169,
-        "sim_best_model": "rev",
+        "sim_base_price": 283.71,
+        "sim_elasticity": 0.0472,
+        "sim_best_model": "ens",
         "sim_rev_alpha": 0.0500,
-
+        "sim_ema_alpha": 0.3000,
+        "sim_holt_alpha": 0.6000,
+        "sim_holt_beta": 0.2000,
     },
     {
         "name":        "ENPT",
@@ -44,10 +48,13 @@ GAMES = [
         "ath_floor":   5378,
         "csv_base":    "enpt",
         # sim price — from elasticity_finder.lua (Rev R²=0.879)
-        "sim_base_price":  10.18,
-        "sim_elasticity":  -0.0199,
-        "sim_best_model":  "rev",
-        "sim_rev_alpha":   0.2,      # update with finder's revAlpha if shown
+        "sim_base_price": 10.24,
+        "sim_elasticity": -0.1760,
+        "sim_best_model": "rev",
+        "sim_rev_alpha": 0.0500,
+        "sim_ema_alpha": 0.0500,
+        "sim_price_std": 0.0824,
+        "sim_ci95": 0.1614,
     },
     {
         "name":        "FLSV",
@@ -57,10 +64,13 @@ GAMES = [
         "ath_floor":   7348,
         "csv_base":    "flsv",
         # sim price — run elasticity_finder.lua on FLSV and paste values here
-        "sim_base_price": 37.33,
-        "sim_elasticity": -0.5670,
+        "sim_base_price": 37.75,
+        "sim_elasticity": -0.0883,
         "sim_best_model": "rev",
         "sim_rev_alpha": 0.0500,
+        "sim_ema_alpha": 0.0500,
+        "sim_price_std": 0.2658,
+        "sim_ci95": 0.5210,
     },
 ]
 

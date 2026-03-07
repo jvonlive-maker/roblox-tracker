@@ -16,10 +16,7 @@ Additions:
   5. Per-slot drift detection — alerts when slot averages lag actuals by >20%
   6. Confidence calibration report in weekly summary
   7. Discord spacer — zero-width space message between each game's embed
-  8. Trend engine — structural pattern detection per game (DOW cycle, decay,
-     macro trend, anomalies, intraday momentum, peak-hour countdown)
-
-Requires: pip install requests
+  8. Trend engine — structural pattern detection (DOW cycle, decay, macro, anomaly, etc.)
 """
 
 import json, logging, os, signal, time, statistics
@@ -28,7 +25,6 @@ from urllib.parse import quote
 
 import requests
 import config
-from trend_engine import run_trend_analysis
 
 logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -74,6 +70,10 @@ CV_NOISE_CEILING    = 30.0   # suppress LONG/SHORT above this CV%
 PEAK_MIN_UPLIFT_PCT = 10.0   # minimum % uplift required to show time-to-peak
 DRIFT_THRESHOLD_PCT = 20.0   # slot avg vs recent actuals % gap to trigger drift alert
 DRIFT_MIN_TICKS     = 8      # need at least this many recent same-slot ticks to check
+AUTOSEED_MIN_TICKS  = 50     # minimum stored ticks required to attempt auto-seed
+AUTOSEED_MIN_SLOT_N = 8      # if avg slot samples < this, trigger auto-seed
+
+DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -98,7 +98,7 @@ def load_data(game):
             data.setdefault("seed_ts",        None)
             data.setdefault("signal_streak",  {"signal": None, "count": 0})
             data.setdefault("drift_warned",   {})
-            data.setdefault("trend_state",    {})   # trend engine cooldown state
+            data.setdefault("trend_state",    {})
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -114,6 +114,50 @@ def load_data(game):
 
 def save_data(game, data):
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))
+
+def autoseed_from_ticks(game, data):
+    """
+    If slot data is sparse, replay stored ticks to rebuild slot stats automatically.
+    No manual seed_redis.py needed — the ticker seeds itself from its own Redis history.
+    Skips if slots already have enough data so live stats are not overwritten.
+    Called once per game on startup (restore_state) and at the start of each tick
+    if slots are still thin.
+    """
+    ticks = data.get("ticks", [])
+    if len(ticks) < AUTOSEED_MIN_TICKS:
+        return False  # not enough history yet
+
+    populated = [s for s in data["slots"].values() if s.get("n", 0) > 0]
+    if populated:
+        avg_n = sum(s["n"] for s in populated) / len(populated)
+        if avg_n >= AUTOSEED_MIN_SLOT_N:
+            return False  # already well-populated
+
+    log.info(f"[{game['name']}] Auto-seeding slots from {len(ticks)} stored ticks...")
+    for t in ticks:
+        try:
+            t_dt = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        key  = f"{t_dt.weekday()}_{t_dt.hour}"
+        ccu_t = t["ccu"]
+        slot = data["slots"].setdefault(key, {
+            "avg": ccu_t, "std": 0.0, "cv": 0.0, "n": 0, "_vals": []
+        })
+        vals = slot.get("_vals") or []
+        vals.append(ccu_t)
+        vals = vals[-30:]
+        slot["_vals"] = vals
+        slot["n"]     = len(vals)
+        slot["avg"]   = sum(vals) / len(vals)
+        slot["std"]   = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        slot["cv"]    = (slot["std"] / slot["avg"] * 100) if slot["avg"] > 0 else 0.0
+        data["slots"][key] = slot
+
+    data["seed_ts"] = ticks[0]["ts"]
+    n_slots = len(data["slots"])
+    log.info(f"[{game['name']}] Auto-seed complete — {len(ticks)} ticks → {n_slots} slots. seed_ts={data['seed_ts']}")
+    return True
 
 def record_snapshot(data, game, dow, hour, ccu, now_est):
     key  = f"{dow}_{hour}"
@@ -184,7 +228,6 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     abs_error = abs(error)
     dh_key    = scored_entry.get("dow_hour", f"{now_dow}_{now_hour}")
 
-    # Per-slot error memory
     se = data["slot_errors"].setdefault(dh_key, {"mae": abs_error, "n": 1, "_errs": [abs_error]})
     errs = se.get("_errs", [se["mae"]])
     errs.append(abs_error)
@@ -194,11 +237,9 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     se["mae"]   = sum(errs) / len(errs)
     data["slot_errors"][dh_key] = se
 
-    # Rolling bias (EMA alpha=0.15)
     alpha        = 0.15
     data["bias"] = data["bias"] * (1 - alpha) + error * alpha
 
-    # Adaptive signal weights
     signals_used = scored_entry.get("signals_used", [])
     weights      = data["signal_weights"]
     pct_error    = abs_error / max(ccu, 1) * 100
@@ -225,7 +266,6 @@ def score_last_prediction(data, ccu, now_dow, now_hour):
     return scored_entry
 
 def prediction_accuracy(data):
-    """Returns (mae, directional_pct, calibration_dict, n)."""
     scored = [e for e in data["pred_log"] if e["actual"] is not None]
     if len(scored) < 3:
         return None, None, None, 0
@@ -267,25 +307,10 @@ def slot_confidence(data, dh_key, cv):
 # ── Drift detection ───────────────────────────────────────────────────────────
 
 def check_slot_drift(game, data, dow, hour, now_date):
-    """
-    Compares stored slot avg against recent actual ticks for the same dow+hour.
-    Only considers ticks recorded after the last reseed (seed_ts) to avoid
-    false positives immediately after a reseed.
-    Fires at most once per 14 days per slot; cooldown resets on reseed.
-    """
     dh_key = f"{dow}_{hour}"
     slot   = data["slots"].get(dh_key)
     if not slot or slot["n"] < config.SIGNAL_MIN_SAMPLES:
         return
-
-    # Parse seed timestamp for post-seed filtering
-    seed_ts = data.get("seed_ts")
-    seed_dt = None
-    if seed_ts:
-        try:
-            seed_dt = datetime.fromisoformat(seed_ts)
-        except (ValueError, TypeError):
-            pass
 
     ticks          = data.get("ticks", [])
     recent_actuals = []
@@ -293,9 +318,6 @@ def check_slot_drift(game, data, dow, hour, now_date):
         try:
             t_dt = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M")
         except ValueError:
-            continue
-        # Only consider ticks recorded after the last reseed
-        if seed_dt and t_dt <= seed_dt:
             continue
         if t_dt.weekday() == dow and t_dt.hour == hour:
             recent_actuals.append(t["ccu"])
@@ -312,16 +334,10 @@ def check_slot_drift(game, data, dow, hour, now_date):
 
     warned = data.setdefault("drift_warned", {})
     last_w = warned.get(dh_key)
-
-    # Cooldown key encodes seed_ts so a reseed always resets it
-    seed_tag   = seed_ts or "noseed"
-    warned_key = f"{dh_key}|{seed_tag}"
-    last_w     = warned.get(warned_key)
-
     if last_w:
         try:
             days_since = (now_date - datetime.fromisoformat(last_w).date()).days
-            if days_since < 14:
+            if days_since < 7:
                 return
         except (ValueError, TypeError):
             pass
@@ -341,7 +357,7 @@ def check_slot_drift(game, data, dow, hour, now_date):
         + f"Consider reseeding: `python3 seed_redis.py`"
     )
     notify(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
-    warned[warned_key]   = now_date.isoformat()
+    warned[dh_key]       = now_date.isoformat()
     data["drift_warned"] = warned
     log.warning(f"[{game['name']}] Drift: {slot_label} avg={slot['avg']:.0f} "
                 f"recent={recent_avg:.0f} drift={drift_pct:+.1f}%")
@@ -364,7 +380,6 @@ def update_streak(data, signal):
 # ── Time-to-peak ──────────────────────────────────────────────────────────────
 
 def time_to_peak(data, now_est):
-    """Today's peak ETA only. No cross-day fallback."""
     if not data["slots"]:
         return None
     dow      = now_est.weekday()
@@ -461,7 +476,6 @@ def restore_state(game, data):
     now_est   = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     today_str = now_est.date().isoformat()
 
-    # Always restore last_tick and midnight_ccu regardless of date
     state.midnight_ccu = s.get("midnight_ccu")
     state.last_tick    = s.get("last_tick")
 
@@ -480,6 +494,10 @@ def restore_state(game, data):
         state.intraday_sum   = 0
         state.intraday_ticks = 0
         log.info(f"[{game['name']}] New day — intraday reset (last_tick kept)")
+
+    # Auto-seed slots from tick history if they're sparse (runs on startup)
+    if autoseed_from_ticks(game, data):
+        save_data(game, data)
 
 def persist_state(game, data, now_est):
     state = get_state(game)
@@ -578,7 +596,6 @@ def compute_signal(data, ccu, dow, hour):
     else:
         signal = "HOLD";  reasoning = f"{pct:+.1f}% vs adj. avg — {trend_str}"
 
-    # Suppress LONG/SHORT when slot is too noisy
     if cv > CV_NOISE_CEILING and signal in ("LONG", "SHORT"):
         log.info(f"[signal suppressed] {signal} → HOLD (cv={cv:.1f}% > {CV_NOISE_CEILING}%)")
         signal    = "HOLD"
@@ -715,8 +732,7 @@ def send_discord(game, title, message, sig, retries=3):
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
-    color_override = sig.get("color_override")
-    color   = color_override if color_override else SIGNAL_COLORS.get(sig["signal"], 0x888888)
+    color = sig.get("color_override") if sig.get("color_override") else SIGNAL_COLORS.get(sig["signal"], 0x888888)
     payload = json.dumps({"embeds": [{"title": title, "description": message,
                                       "color": color,
                                       "footer": {"text": f"{game['name']}  •  EST"}}]})
@@ -733,7 +749,6 @@ def send_discord(game, title, message, sig, retries=3):
             time.sleep(2**attempt)
 
 def send_spacer():
-    """Send a zero-width space message to create visual gap between game embeds."""
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
@@ -766,6 +781,305 @@ def fetch_ccu(game, retries=3):
                 log.error(f"[{game['name']}] Roblox API failed: {e}"); return None
             time.sleep(2**attempt)
     return None
+
+# ── Trend engine ──────────────────────────────────────────────────────────────
+
+def _trend_cooldown_ok(data, key, hours):
+    ts_store = data.get("trend_state", {}).get(key)
+    if not ts_store:
+        return True
+    try:
+        last = datetime.fromisoformat(ts_store)
+        return (datetime.now(timezone.utc) - last).total_seconds() > hours * 3600
+    except (ValueError, TypeError):
+        return True
+
+def _trend_mark(data, key, now_est):
+    data.setdefault("trend_state", {})[key] = now_est.isoformat()
+
+def _dow_avgs(data):
+    """Average CCU per day-of-week, using all slots for that DOW."""
+    result = {}
+    for d in range(7):
+        vals = [s["avg"] for k, s in data["slots"].items()
+                if k.startswith(f"{d}_") and s.get("n", 0) >= 3]
+        result[d] = sum(vals) / len(vals) if vals else None
+    return result
+
+def _rolling_weekly_avgs(ticks, weeks):
+    from collections import defaultdict
+    by_week = defaultdict(list)
+    for t in ticks:
+        try:
+            dt = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        iso = dt.isocalendar()
+        by_week[f"{iso[0]}-W{iso[1]:02d}"].append(t["ccu"])
+    keys = sorted(by_week)[-weeks:]
+    return [sum(by_week[k]) / len(by_week[k]) for k in keys if by_week[k]]
+
+def run_trend_analysis(game, data, ccu, dow, hour, now_est):
+    """
+    Detect structural patterns in a game's stored tick data and fire Discord
+    alerts for any that are new or changed. Works for any game — game-agnostic.
+
+    Patterns detected:
+      DOW_SPIKE        — one day consistently far above its neighbors
+      REVERSAL         — at structural trough with spike day approaching
+      PEAK_BREAKDOWN   — structural spike day running significantly below its own avg
+      DECAY_ACCEL      — same DOW declining week-over-week beyond normal noise
+      MACRO_TREND      — 4-week vs 8-week rolling avg crossover (growth/decline)
+      ANOMALY_HIGH/LOW — current CCU is an extreme z-score outlier for this slot
+      PEAK_HOUR        — historical peak hour for today's DOW is <3h away
+      MOMENTUM         — 3 consecutive same-direction ticks with above-avg magnitude
+    """
+    # Need enough slot history before running anything
+    if sum(1 for s in data["slots"].values() if s.get("n", 0) >= 4) < 6:
+        return
+
+    cooldown_h  = game.get("trend_alert_cooldown_h", 6)
+    spike_ratio = game.get("trend_spike_ratio", 1.8)
+    anomaly_sig = game.get("trend_anomaly_sigma", 2.5)
+    dow_avgs    = _dow_avgs(data)
+    valid_avgs  = {d: v for d, v in dow_avgs.items() if v}
+    ticks       = data.get("ticks", [])
+
+    def _fire(title, body, color):
+        notify(game, title, body, {"signal": "HOLD", "color_override": color})
+
+    # ── 1. DOW spike day ──────────────────────────────────────────────────────
+    if len(valid_avgs) >= 5:
+        for d, avg in valid_avgs.items():
+            neighbors = [valid_avgs.get((d-1)%7), valid_avgs.get((d+1)%7)]
+            neighbors = [n for n in neighbors if n]
+            if not neighbors:
+                continue
+            ratio = avg / (sum(neighbors) / len(neighbors))
+            if ratio >= spike_ratio and dow in (d, (d-1)%7):
+                key = f"dow_spike_{d}"
+                if _trend_cooldown_ok(data, key, cooldown_h * 24 * 3):
+                    _trend_mark(data, key, now_est)
+                    prev_avg = valid_avgs.get((d-1)%7, 0)
+                    _fire(
+                        f"📈 {game['name']} — Structural Spike: {DAYS[d]}",
+                        f"{DAYS[d]} is a confirmed structural spike day.\n\n"
+                        f"Avg CCU:    {int(avg):,}\n"
+                        f"vs {DAYS[(d-1)%7]}:      {int(prev_avg):,}  ({ratio:.1f}× ratio)\n\n"
+                        f"Signal: LONG — {DAYS[d]} CCU historically {ratio:.1f}× above neighbors.",
+                        0xF9C74F,
+                    )
+                    log.info(f"[{game['name']}] Trend: DOW_SPIKE {DAYS[d]} ({ratio:.1f}×)")
+
+    # ── 2. Reversal setup ─────────────────────────────────────────────────────
+    if len(valid_avgs) >= 5:
+        trough_d = min(valid_avgs, key=valid_avgs.get)
+        peak_d   = max(valid_avgs, key=valid_avgs.get)
+        days_to_peak = (peak_d - dow) % 7
+        ratio = valid_avgs[peak_d] / valid_avgs[trough_d] if valid_avgs[trough_d] else 0
+        if (dow == trough_d or valid_avgs.get(dow, 0) / valid_avgs[trough_d] <= 1.15) \
+                and 0 < days_to_peak <= 3 and ratio >= 1.5:
+            key = f"reversal_{trough_d}"
+            if _trend_cooldown_ok(data, key, cooldown_h * 18):
+                _trend_mark(data, key, now_est)
+                _fire(
+                    f"🔄 {game['name']} — Reversal Setup",
+                    f"At structural weekly LOW ({DAYS[trough_d]} avg {int(valid_avgs[trough_d]):,}).\n"
+                    f"Peak day ({DAYS[peak_d]}) is {days_to_peak} day(s) away — avg {int(valid_avgs[peak_d]):,}.\n\n"
+                    f"Live CCU:    {ccu:,}\n"
+                    f"Expected ×:  {ratio:.1f}×\n\n"
+                    f"Signal: LONG — buy the trough, ride to {DAYS[peak_d]}.",
+                    0x43E97B,
+                )
+                log.info(f"[{game['name']}] Trend: REVERSAL trough={DAYS[trough_d]} peak={DAYS[peak_d]}")
+
+    # ── 3. Peak day breakdown ─────────────────────────────────────────────────
+    if len(valid_avgs) >= 5:
+        peak_d = max(valid_avgs, key=valid_avgs.get)
+        if dow == peak_d:
+            slot = data["slots"].get(f"{dow}_{hour}")
+            if slot and slot["n"] >= 5:
+                pct_vs_avg = (ccu - slot["avg"]) / slot["avg"] * 100
+                if pct_vs_avg < -25:
+                    key = f"peak_breakdown_{dow}"
+                    if _trend_cooldown_ok(data, key, cooldown_h):
+                        _trend_mark(data, key, now_est)
+                        severity = "SEVERE" if pct_vs_avg < -40 else "MODERATE"
+                        _fire(
+                            f"⚠️ {game['name']} — {severity} Peak Breakdown ({DAYS[peak_d]})",
+                            f"{DAYS[peak_d]} is the spike day but CCU is {abs(pct_vs_avg):.0f}% below its own avg.\n\n"
+                            f"Live CCU:    {ccu:,}\n"
+                            f"Slot avg:    {int(slot['avg']):,}\n"
+                            f"Deviation:   {pct_vs_avg:+.0f}%\n\n"
+                            f"Signal: {'SHORT — structural support failing.' if pct_vs_avg < -40 else 'HOLD — watch for recovery.'}",
+                            0xEF233C if severity == "SEVERE" else 0xFF6B35,
+                        )
+                        log.info(f"[{game['name']}] Trend: PEAK_BREAKDOWN {pct_vs_avg:+.0f}%")
+
+    # ── 4. Decay acceleration ─────────────────────────────────────────────────
+    if len(ticks) >= 40:
+        dow_vals = [t["ccu"] for t in ticks
+                    if datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M").weekday() == dow
+                    if True][:0]  # placeholder — collect properly below
+        dow_vals = []
+        for t in ticks:
+            try:
+                if datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M").weekday() == dow:
+                    dow_vals.append(t["ccu"])
+            except ValueError:
+                pass
+        if len(dow_vals) >= 4:
+            recent_avg = sum(dow_vals[-2:]) / 2
+            prior_avg  = sum(dow_vals[-4:-2]) / 2
+            if prior_avg > 0:
+                decay_pct = (recent_avg - prior_avg) / prior_avg * 100
+                if decay_pct < -15:
+                    key = f"decay_accel_{dow}"
+                    if _trend_cooldown_ok(data, key, cooldown_h * 4):
+                        _trend_mark(data, key, now_est)
+                        _fire(
+                            f"📉 {game['name']} — Decay Accelerating ({DAYS[dow]})",
+                            f"{DAYS[dow]} CCU declining faster than normal week-over-week.\n\n"
+                            f"Recent 2-week avg:  {int(recent_avg):,}\n"
+                            f"Prior 2-week avg:   {int(prior_avg):,}\n"
+                            f"Δ:                  {decay_pct:+.1f}%\n\n"
+                            f"Signal: BEARISH — weekly floor eroding.",
+                            0xEF233C,
+                        )
+                        log.info(f"[{game['name']}] Trend: DECAY_ACCEL {DAYS[dow]} {decay_pct:+.1f}%")
+
+    # ── 5. Macro trend ────────────────────────────────────────────────────────
+    avgs_8 = _rolling_weekly_avgs(ticks, 8)
+    avgs_4 = _rolling_weekly_avgs(ticks, 4)
+    if len(avgs_8) >= 4 and len(avgs_4) >= 2:
+        slow = sum(avgs_8[-4:]) / 4
+        fast = sum(avgs_4[-2:]) / 2
+        if slow > 0:
+            pct = (fast - slow) / slow * 100
+            prev_dir = data.get("trend_state", {}).get("macro_direction", "FLAT")
+            if abs(pct) >= 10:
+                direction    = "UP" if pct > 0 else "DOWN"
+                is_reversal  = (direction == "UP" and prev_dir != "UP") or \
+                               (direction == "DOWN" and prev_dir != "DOWN")
+                key = "macro_trend"
+                if _trend_cooldown_ok(data, key, cooldown_h * 4 * 24):
+                    _trend_mark(data, key, now_est)
+                    data.setdefault("trend_state", {})["macro_direction"] = direction
+                    if is_reversal and direction == "UP":
+                        t = f"📈 {game['name']} — Macro Reversal: RECOVERY"
+                        b = f"4-week avg crossed ABOVE 8-week — macro uptrend starting.\n\n" \
+                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: LONG — macro tailwind."
+                        c = 0x43E97B
+                    elif is_reversal:
+                        t = f"📉 {game['name']} — Macro Reversal: DECLINE"
+                        b = f"4-week avg crossed BELOW 8-week — macro downtrend starting.\n\n" \
+                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: SHORT — macro headwind."
+                        c = 0xEF233C
+                    elif direction == "UP":
+                        t = f"📈 {game['name']} — Macro Trend: UPTREND"
+                        b = f"4-week avg remains above 8-week — uptrend intact.\n\n" \
+                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%"
+                        c = 0x43E97B
+                    else:
+                        t = f"📉 {game['name']} — Macro Trend: DOWNTREND"
+                        b = f"4-week avg remains below 8-week — downtrend intact.\n\n" \
+                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%"
+                        c = 0xEF233C
+                    _fire(t, b, c)
+                    log.info(f"[{game['name']}] Trend: MACRO_{direction} {pct:+.1f}%")
+
+    # ── 6. Anomaly (z-score) ──────────────────────────────────────────────────
+    slot = data["slots"].get(f"{dow}_{hour}")
+    if slot and slot["n"] >= 6 and slot.get("std", 0) > 0:
+        z = (ccu - slot["avg"]) / slot["std"]
+        if abs(z) >= anomaly_sig:
+            direction = "HIGH" if z > 0 else "LOW"
+            key = f"anomaly_{direction}"
+            if _trend_cooldown_ok(data, key, cooldown_h):
+                _trend_mark(data, key, now_est)
+                if direction == "HIGH":
+                    _fire(
+                        f"🚨 {game['name']} — Anomaly: SPIKE (+{z:.1f}σ)",
+                        f"CCU is {z:.1f}σ ABOVE slot average — possible event or viral moment.\n\n"
+                        f"Live CCU:  {ccu:,}\nSlot avg:  {int(slot['avg']):,}\n"
+                        f"Slot σ:    {int(slot['std']):,}\n\n"
+                        f"Signal: LONG momentum — monitor for sustainability.",
+                        0xFF6B35,
+                    )
+                else:
+                    _fire(
+                        f"🚨 {game['name']} — Anomaly: CRASH ({z:.1f}σ)",
+                        f"CCU is {abs(z):.1f}σ BELOW slot average — possible outage or content issue.\n\n"
+                        f"Live CCU:  {ccu:,}\nSlot avg:  {int(slot['avg']):,}\n"
+                        f"Slot σ:    {int(slot['std']):,}\n\n"
+                        f"Signal: SHORT — investigate before acting.",
+                        0xEF233C,
+                    )
+                log.info(f"[{game['name']}] Trend: ANOMALY_{direction} z={z:.1f}")
+
+    # ── 7. Peak hour incoming ─────────────────────────────────────────────────
+    best_h, best_avg = -1, -1
+    for h in range(24):
+        s = data["slots"].get(f"{dow}_{h}")
+        if s and s["avg"] > best_avg:
+            best_avg = s["avg"]
+            best_h   = h
+    if best_h >= 0:
+        hours_away = (best_h - hour) % 24
+        if 0 < hours_away <= 3:
+            curr_avg = (data["slots"].get(f"{dow}_{hour}") or {}).get("avg", 1)
+            uplift   = (best_avg - curr_avg) / max(curr_avg, 1) * 100
+            if uplift >= 15:
+                key = f"peak_hour_{dow}"
+                if _trend_cooldown_ok(data, key, 20):
+                    _trend_mark(data, key, now_est)
+                    _fire(
+                        f"⏰ {game['name']} — Peak Hour in {hours_away}h ({DAYS[dow]} {best_h:02d}:00)",
+                        f"Historical peak for {DAYS[dow]} is {best_h:02d}:00 — {hours_away}h away.\n\n"
+                        f"Current avg ({hour:02d}:00):  {int(curr_avg):,}\n"
+                        f"Peak avg    ({best_h:02d}:00):  {int(best_avg):,}\n"
+                        f"Expected uplift:     +{uplift:.0f}%\n\n"
+                        f"Signal: LONG before {best_h:02d}:00.",
+                        0x90E0EF,
+                    )
+                    log.info(f"[{game['name']}] Trend: PEAK_HOUR {best_h:02d}:00 (+{uplift:.0f}%)")
+
+    # ── 8. Intraday momentum ──────────────────────────────────────────────────
+    if len(ticks) >= 4:
+        recent_vals = [t["ccu"] for t in ticks[-4:]]
+        deltas = [recent_vals[i+1] - recent_vals[i] for i in range(3)]
+        slot   = data["slots"].get(f"{dow}_{hour}")
+        if slot and slot.get("std", 0) > 0:
+            all_up   = all(d > 0 for d in deltas)
+            all_down = all(d < 0 for d in deltas)
+            avg_mag  = sum(abs(d) for d in deltas) / 3
+            if (all_up or all_down) and avg_mag >= slot["std"] * 0.5:
+                direction = "UP" if all_up else "DOWN"
+                key = f"momentum_{direction}"
+                if _trend_cooldown_ok(data, key, cooldown_h * 0.5):
+                    _trend_mark(data, key, now_est)
+                    total_move = recent_vals[-1] - recent_vals[0]
+                    pct_move   = total_move / max(recent_vals[0], 1) * 100
+                    delta_str  = "  ".join(f"{d:+}" for d in deltas)
+                    if direction == "UP":
+                        _fire(
+                            f"🚀 {game['name']} — Momentum: ACCELERATING",
+                            f"3 consecutive up ticks above avg magnitude.\n\n"
+                            f"Δ ticks:  {delta_str}\n"
+                            f"Total:    {total_move:+,} ({pct_move:+.1f}%)\n\n"
+                            f"Signal: SHORT-TERM LONG.",
+                            0x43E97B,
+                        )
+                    else:
+                        _fire(
+                            f"📉 {game['name']} — Momentum: DECLINING",
+                            f"3 consecutive down ticks above avg magnitude.\n\n"
+                            f"Δ ticks:  {delta_str}\n"
+                            f"Total:    {total_move:+,} ({pct_move:+.1f}%)\n\n"
+                            f"Signal: SHORT-TERM SHORT.",
+                            0xEF233C,
+                        )
+                    log.info(f"[{game['name']}] Trend: MOMENTUM_{direction} {total_move:+}")
 
 # ── Weekly summary ────────────────────────────────────────────────────────────
 
@@ -817,8 +1131,6 @@ def send_daily_summary(game, data):
 
 # ── Main tick ─────────────────────────────────────────────────────────────────
 
-DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-
 def run_tick(game):
     now_est = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
     dow     = now_est.weekday()
@@ -841,6 +1153,7 @@ def run_tick(game):
     if ccu is None: return
 
     data   = load_data(game)
+    autoseed_from_ticks(game, data)   # no-op if slots already populated
     scored = score_last_prediction(data, ccu, dow, now_est.hour)
 
     avg_hour, ath, is_new_ath = record_snapshot(data, game, dow, now_est.hour, ccu, now_est)
@@ -879,12 +1192,13 @@ def run_tick(game):
     else:
         pred_str = "—"
 
-    # Stop loss / take profit
+    # Stop loss / take profit — only on actionable LONG or SHORT signals
     sl_tp_lines = ""
     dh_key = f"{dow}_{now_est.hour}"
     se     = data["slot_errors"].get(dh_key)
     use_sl_tp = (
-        pred["confidence"] == "High"
+        sig["signal"] in ("LONG", "SHORT")
+        and pred["confidence"] == "High"
         and pred["predicted_ccu"] is not None
         and pred["std"] is not None
         and cv_val is not None and cv_val < 20
@@ -895,13 +1209,26 @@ def run_tick(game):
     )
     if use_sl_tp:
         std = pred["std"]
-        tp  = round(pred["predicted_ccu"] + 1.0 * std)
-        sl  = round(pred["predicted_ccu"] - 1.5 * std)
-        sl  = max(sl, 0)
-        if sl == 0 or tp <= ccu:
-            sl_tp_lines = ""
-        else:
-            sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
+        if sig["signal"] == "LONG":
+            # Entered long at ccu — expect price to rise
+            # TP above predicted, SL below predicted
+            tp = round(pred["predicted_ccu"] + 1.0 * std)
+            sl = round(pred["predicted_ccu"] - 1.5 * std)
+            sl = max(sl, 0)
+            if sl == 0 or tp <= ccu:
+                sl_tp_lines = ""
+            else:
+                sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
+        else:  # SHORT
+            # Entered short at ccu — expect price to fall
+            # TP below predicted, SL above predicted
+            tp = round(pred["predicted_ccu"] - 1.0 * std)
+            sl = round(pred["predicted_ccu"] + 1.5 * std)
+            tp = max(tp, 0)
+            if tp >= ccu:
+                sl_tp_lines = ""
+            else:
+                sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
 
     mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
     acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
@@ -918,10 +1245,8 @@ def run_tick(game):
     check_slot_drift(game, data, dow, now_est.hour, today)
     check_reseed_reminder(game, data)
 
-    # ── Trend engine ──────────────────────────────────────────────────────────
-    # Runs after slot data is recorded. Fires its own Discord alerts independently.
-    # Mutates data["trend_state"] for cooldown tracking — saved below.
-    run_trend_analysis(game, data, ccu, now_est, send_fn=notify)
+    # ── Trend analysis — runs after snapshot, before save ─────────────────────
+    run_trend_analysis(game, data, ccu, dow, now_est.hour, now_est)
 
     if is_new_ath:
         prev_ath  = game["ath_floor"]
@@ -1021,7 +1346,6 @@ if __name__ == "__main__":
                 if _shutdown: break
                 try:
                     run_tick(game)
-                    # Send spacer after every game except the last
                     if i < len(config.GAMES) - 1:
                         send_spacer()
                 except Exception as e:

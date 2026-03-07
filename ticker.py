@@ -2,7 +2,9 @@
 ticker.py
 Multi-game Roblox CCU ticker.
 - Polls every game in config.GAMES every 15 min
-- Sends alerts to Discord webhook
+- Sends alerts to TWO Discord webhooks:
+    * config.DISCORD_WEBHOOK        — simple, friendly alerts for new players
+    * config.DISCORD_WEBHOOK_DETAIL — full technical data for analysts
 - Persists state in Upstash Redis
 - Self-improving: adaptive signal weights, bias correction, per-slot error memory
 
@@ -17,6 +19,7 @@ Additions:
   6. Confidence calibration report in weekly summary
   7. Discord spacer — zero-width space message between each game's embed
   8. Trend engine — structural pattern detection (DOW cycle, decay, macro, anomaly, etc.)
+  9. Dual-webhook: simple friendly embed + detailed technical embed
 """
 
 import json, logging, os, signal, time, statistics
@@ -45,6 +48,14 @@ http.headers.update({"User-Agent": "Mozilla/5.0"})
 REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL",   "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
+# ── Dual-webhook config ───────────────────────────────────────────────────────
+# Simple/friendly webhook — set in config.py as DISCORD_WEBHOOK
+# Detailed/technical webhook — hardcoded here (or override in config.py)
+DISCORD_WEBHOOK_DETAIL = getattr(
+    config, "DISCORD_WEBHOOK_DETAIL",
+    "https://discord.com/api/webhooks/1479713619418546220/EJIhFTWN-XZz-cIzIxuQxQC_IXntYoK2eo5FOiRlKKyBw9LpDaeAaY6b9_7SPOhluYXj"
+)
+
 def _rh(): return {"Authorization": f"Bearer {REDIS_TOKEN}"}
 
 def redis_get(key):
@@ -66,14 +77,28 @@ def redis_set(key, value, retries=3):
     log.error("All Redis SET attempts failed.")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CV_NOISE_CEILING    = 30.0   # suppress LONG/SHORT above this CV%
-PEAK_MIN_UPLIFT_PCT = 10.0   # minimum % uplift required to show time-to-peak
-DRIFT_THRESHOLD_PCT = 20.0   # slot avg vs recent actuals % gap to trigger drift alert
-DRIFT_MIN_TICKS     = 8      # need at least this many recent same-slot ticks to check
-AUTOSEED_MIN_TICKS  = 50     # minimum stored ticks required to attempt auto-seed
-AUTOSEED_MIN_SLOT_N = 8      # if avg slot samples < this, trigger auto-seed
+CV_NOISE_CEILING    = 30.0
+PEAK_MIN_UPLIFT_PCT = 10.0
+DRIFT_THRESHOLD_PCT = 20.0
+DRIFT_MIN_TICKS     = 8
+AUTOSEED_MIN_TICKS  = 50
+AUTOSEED_MIN_SLOT_N = 8
 
 DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
+# ── Friendly signal descriptions for new players ──────────────────────────────
+FRIENDLY_SIGNAL = {
+    "LONG":              ("🟢 Good time to play!", "Player count is lower than usual but trending up — more players joining soon."),
+    "SHORT":             ("🔴 Busy right now",     "Player count is higher than usual and may drop soon. Expect more competition."),
+    "HOLD":              ("🟡 Normal activity",    "Player counts are about where we'd expect. Nothing unusual going on."),
+    "INSUFFICIENT DATA": ("⚪ Still learning...",  "We haven't collected enough data for this time slot yet. Check back later!"),
+}
+
+FRIENDLY_TREND_EMOJI = {
+    "🔥 BREAKOUT": "🔥 Way more players than usual!",
+    "📉 BELOW AVG": "📉 Fewer players than usual",
+    "⚖️ Stable":   "⚖️ About normal",
+}
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -117,22 +142,15 @@ def save_data(game, data):
     redis_set(game["redis_key"], json.dumps(data, separators=(",", ":")))
 
 def autoseed_from_ticks(game, data):
-    """
-    If slot data is sparse, replay stored ticks to rebuild slot stats automatically.
-    No manual seed_redis.py needed — the ticker seeds itself from its own Redis history.
-    Skips if slots already have enough data so live stats are not overwritten.
-    Called once per game on startup (restore_state) and at the start of each tick
-    if slots are still thin.
-    """
     ticks = data.get("ticks", [])
     if len(ticks) < AUTOSEED_MIN_TICKS:
-        return False  # not enough history yet
+        return False
 
     populated = [s for s in data["slots"].values() if s.get("n", 0) > 0]
     if populated:
         avg_n = sum(s["n"] for s in populated) / len(populated)
         if avg_n >= AUTOSEED_MIN_SLOT_N:
-            return False  # already well-populated
+            return False
 
     log.info(f"[{game['name']}] Auto-seeding slots from {len(ticks)} stored ticks...")
     for t in ticks:
@@ -157,7 +175,7 @@ def autoseed_from_ticks(game, data):
 
     data["seed_ts"] = ticks[0]["ts"]
     n_slots = len(data["slots"])
-    log.info(f"[{game['name']}] Auto-seed complete — {len(ticks)} ticks → {n_slots} slots. seed_ts={data['seed_ts']}")
+    log.info(f"[{game['name']}] Auto-seed complete — {len(ticks)} ticks → {n_slots} slots.")
     return True
 
 def record_snapshot(data, game, dow, hour, ccu, now_est):
@@ -357,7 +375,7 @@ def check_slot_drift(game, data, dow, hour, now_date):
            else "Predictions skewing low — false SHORTs likely.\n")
         + f"Consider reseeding: `python3 seed_redis.py`"
     )
-    notify(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
+    notify_detail(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
     warned[dh_key]       = now_date.isoformat()
     data["drift_warned"] = warned
     log.warning(f"[{game['name']}] Drift: {slot_label} avg={slot['avg']:.0f} "
@@ -448,7 +466,7 @@ def check_reseed_reminder(game, data):
         f"`python3 seed_redis.py`\n"
         f"then redeploy."
     )
-    notify(game, f"⚠️ {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})
+    notify_detail(game, f"⚠️ {game['name']} — Time to Reseed", msg, {"signal": "HOLD"})
     data["reseed_warned"] = now_date.isoformat()
     log.info(f"[{game['name']}] Reseed reminder sent (age={age_days}d)")
 
@@ -496,7 +514,6 @@ def restore_state(game, data):
         state.intraday_ticks = 0
         log.info(f"[{game['name']}] New day — intraday reset (last_tick kept)")
 
-    # Auto-seed slots from tick history if they're sparse (runs on startup)
     if autoseed_from_ticks(game, data):
         save_data(game, data)
 
@@ -727,46 +744,84 @@ def detect_event(data, ccu, dow, hour, pct_15m):
         return f"🚨 POSSIBLE EVENT  ({ratio:.1f}x normal)"
     return None
 
-# ── Discord ───────────────────────────────────────────────────────────────────
+# ── Discord helpers ───────────────────────────────────────────────────────────
 
-def send_discord(game, title, message, sig, retries=3):
-    webhook = config.DISCORD_WEBHOOK
-    if not webhook:
+def _post_webhook(webhook_url, payload_json, game_name, retries=3):
+    """Low-level POST to a Discord webhook with retry logic."""
+    if not webhook_url:
         return
-    color = sig.get("color_override") if sig.get("color_override") else SIGNAL_COLORS.get(sig["signal"], 0x888888)
-    payload = json.dumps({"embeds": [{"title": title, "description": message,
-                                      "color": color,
-                                      "footer": {"text": f"{game['name']}  •  EST"}}]})
-    for attempt in range(1, retries+1):
+    for attempt in range(1, retries + 1):
         try:
-            r = http.post(webhook, data=payload,
+            r = http.post(webhook_url, data=payload_json,
                           headers={"Content-Type": "application/json"}, timeout=10)
             if r.status_code == 429:
-                time.sleep(r.json().get("retry_after", 2)); continue
-            r.raise_for_status(); return
+                time.sleep(r.json().get("retry_after", 2))
+                continue
+            r.raise_for_status()
+            return
         except requests.RequestException as e:
             if attempt == retries:
-                log.error(f"[{game['name']}] Discord failed: {e}"); return
-            time.sleep(2**attempt)
+                log.error(f"[{game_name}] Discord failed: {e}")
+                return
+            time.sleep(2 ** attempt)
 
-def send_spacer():
+def send_discord_simple(game, title, message, sig):
+    """Send a clean, beginner-friendly embed to the main webhook."""
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
+    color   = SIGNAL_COLORS.get(sig["signal"], 0x888888)
+    payload = json.dumps({
+        "embeds": [{
+            "title":       title,
+            "description": message,
+            "color":       color,
+            "footer":      {"text": f"{game['name']}  •  EST"},
+        }]
+    })
+    _post_webhook(webhook, payload, game["name"])
+
+def send_discord_detail(game, title, message, sig):
+    """Send a full technical embed to the detail webhook."""
+    if not DISCORD_WEBHOOK_DETAIL:
+        return
+    color   = sig.get("color_override") or SIGNAL_COLORS.get(sig["signal"], 0x888888)
+    payload = json.dumps({
+        "embeds": [{
+            "title":       title,
+            "description": message,
+            "color":       color,
+            "footer":      {"text": f"{game['name']}  •  EST"},
+        }]
+    })
+    _post_webhook(DISCORD_WEBHOOK_DETAIL, payload, game["name"])
+
+def send_spacer(webhook_url=None):
+    """Zero-width spacer between game embeds."""
+    targets = [w for w in [webhook_url or config.DISCORD_WEBHOOK, DISCORD_WEBHOOK_DETAIL] if w]
     payload = json.dumps({"content": "\u200b"})
-    try:
-        r = http.post(webhook, data=payload,
-                      headers={"Content-Type": "application/json"}, timeout=10)
-        if r.status_code == 429:
-            time.sleep(r.json().get("retry_after", 2))
-            http.post(webhook, data=payload,
-                      headers={"Content-Type": "application/json"}, timeout=10)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.warning(f"Spacer failed: {e}")
+    for url in targets:
+        try:
+            r = http.post(url, data=payload,
+                          headers={"Content-Type": "application/json"}, timeout=10)
+            if r.status_code == 429:
+                time.sleep(r.json().get("retry_after", 2))
+                http.post(url, data=payload,
+                          headers={"Content-Type": "application/json"}, timeout=10)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.warning(f"Spacer failed ({url[:40]}...): {e}")
+
+# ── notify wrappers ───────────────────────────────────────────────────────────
 
 def notify(game, title, message, sig):
-    send_discord(game, title, message, sig)
+    """Send to BOTH webhooks (used for regular ticks)."""
+    send_discord_simple(game, title, message, sig)
+    send_discord_detail(game, title, message, sig)
+
+def notify_detail(game, title, message, sig):
+    """Send ONLY to the detail webhook (drift, reseed, trend alerts, etc.)."""
+    send_discord_detail(game, title, message, sig)
 
 # ── Roblox API ────────────────────────────────────────────────────────────────
 
@@ -799,7 +854,6 @@ def _trend_mark(data, key, now_est):
     data.setdefault("trend_state", {})[key] = now_est.isoformat()
 
 def _dow_avgs(data):
-    """Average CCU per day-of-week, using all slots for that DOW."""
     result = {}
     for d in range(7):
         vals = [s["avg"] for k, s in data["slots"].items()
@@ -821,21 +875,7 @@ def _rolling_weekly_avgs(ticks, weeks):
     return [sum(by_week[k]) / len(by_week[k]) for k in keys if by_week[k]]
 
 def run_trend_analysis(game, data, ccu, dow, hour, now_est):
-    """
-    Detect structural patterns in a game's stored tick data and fire Discord
-    alerts for any that are new or changed. Works for any game — game-agnostic.
-
-    Patterns detected:
-      DOW_SPIKE        — one day consistently far above its neighbors
-      REVERSAL         — at structural trough with spike day approaching
-      PEAK_BREAKDOWN   — structural spike day running significantly below its own avg
-      DECAY_ACCEL      — same DOW declining week-over-week beyond normal noise
-      MACRO_TREND      — 4-week vs 8-week rolling avg crossover (growth/decline)
-      ANOMALY_HIGH/LOW — current CCU is an extreme z-score outlier for this slot
-      PEAK_HOUR        — historical peak hour for today's DOW is <3h away
-      MOMENTUM         — 3 consecutive same-direction ticks with above-avg magnitude
-    """
-    # Need enough slot history before running anything
+    """Detect structural patterns — alerts sent only to detail webhook."""
     if sum(1 for s in data["slots"].values() if s.get("n", 0) >= 4) < 6:
         return
 
@@ -847,7 +887,7 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
     ticks       = data.get("ticks", [])
 
     def _fire(title, body, color):
-        notify(game, title, body, {"signal": "HOLD", "color_override": color})
+        notify_detail(game, title, body, {"signal": "HOLD", "color_override": color})
 
     # ── 1. DOW spike day ──────────────────────────────────────────────────────
     if len(valid_avgs) >= 5:
@@ -870,7 +910,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                         f"Signal: LONG — {DAYS[d]} CCU historically {ratio:.1f}× above neighbors.",
                         0xF9C74F,
                     )
-                    log.info(f"[{game['name']}] Trend: DOW_SPIKE {DAYS[d]} ({ratio:.1f}×)")
 
     # ── 2. Reversal setup ─────────────────────────────────────────────────────
     if len(valid_avgs) >= 5:
@@ -892,7 +931,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                     f"Signal: LONG — buy the trough, ride to {DAYS[peak_d]}.",
                     0x43E97B,
                 )
-                log.info(f"[{game['name']}] Trend: REVERSAL trough={DAYS[trough_d]} peak={DAYS[peak_d]}")
 
     # ── 3. Peak day breakdown ─────────────────────────────────────────────────
     if len(valid_avgs) >= 5:
@@ -915,13 +953,9 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                             f"Signal: {'SHORT — structural support failing.' if pct_vs_avg < -40 else 'HOLD — watch for recovery.'}",
                             0xEF233C if severity == "SEVERE" else 0xFF6B35,
                         )
-                        log.info(f"[{game['name']}] Trend: PEAK_BREAKDOWN {pct_vs_avg:+.0f}%")
 
     # ── 4. Decay acceleration ─────────────────────────────────────────────────
     if len(ticks) >= 40:
-        dow_vals = [t["ccu"] for t in ticks
-                    if datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M").weekday() == dow
-                    if True][:0]  # placeholder — collect properly below
         dow_vals = []
         for t in ticks:
             try:
@@ -947,7 +981,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                             f"Signal: BEARISH — weekly floor eroding.",
                             0xEF233C,
                         )
-                        log.info(f"[{game['name']}] Trend: DECAY_ACCEL {DAYS[dow]} {decay_pct:+.1f}%")
 
     # ── 5. Macro trend ────────────────────────────────────────────────────────
     avgs_8 = _rolling_weekly_avgs(ticks, 8)
@@ -959,35 +992,34 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
             pct = (fast - slow) / slow * 100
             prev_dir = data.get("trend_state", {}).get("macro_direction", "FLAT")
             if abs(pct) >= 10:
-                direction    = "UP" if pct > 0 else "DOWN"
-                is_reversal  = (direction == "UP" and prev_dir != "UP") or \
-                               (direction == "DOWN" and prev_dir != "DOWN")
+                direction   = "UP" if pct > 0 else "DOWN"
+                is_reversal = (direction == "UP" and prev_dir != "UP") or \
+                              (direction == "DOWN" and prev_dir != "DOWN")
                 key = "macro_trend"
                 if _trend_cooldown_ok(data, key, cooldown_h * 4 * 24):
                     _trend_mark(data, key, now_est)
                     data.setdefault("trend_state", {})["macro_direction"] = direction
                     if is_reversal and direction == "UP":
                         t = f"📈 {game['name']} — Macro Reversal: RECOVERY"
-                        b = f"4-week avg crossed ABOVE 8-week — macro uptrend starting.\n\n" \
-                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: LONG — macro tailwind."
+                        b = (f"4-week avg crossed ABOVE 8-week — macro uptrend starting.\n\n"
+                             f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: LONG — macro tailwind.")
                         c = 0x43E97B
                     elif is_reversal:
                         t = f"📉 {game['name']} — Macro Reversal: DECLINE"
-                        b = f"4-week avg crossed BELOW 8-week — macro downtrend starting.\n\n" \
-                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: SHORT — macro headwind."
+                        b = (f"4-week avg crossed BELOW 8-week — macro downtrend starting.\n\n"
+                             f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%\n\nSignal: SHORT — macro headwind.")
                         c = 0xEF233C
                     elif direction == "UP":
                         t = f"📈 {game['name']} — Macro Trend: UPTREND"
-                        b = f"4-week avg remains above 8-week — uptrend intact.\n\n" \
-                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%"
+                        b = (f"4-week avg remains above 8-week — uptrend intact.\n\n"
+                             f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%")
                         c = 0x43E97B
                     else:
                         t = f"📉 {game['name']} — Macro Trend: DOWNTREND"
-                        b = f"4-week avg remains below 8-week — downtrend intact.\n\n" \
-                            f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%"
+                        b = (f"4-week avg remains below 8-week — downtrend intact.\n\n"
+                             f"4-week avg:  {int(fast):,}\n8-week avg:  {int(slow):,}\nΔ: {pct:+.1f}%")
                         c = 0xEF233C
                     _fire(t, b, c)
-                    log.info(f"[{game['name']}] Trend: MACRO_{direction} {pct:+.1f}%")
 
     # ── 6. Anomaly (z-score) ──────────────────────────────────────────────────
     slot = data["slots"].get(f"{dow}_{hour}")
@@ -1016,7 +1048,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                         f"Signal: SHORT — investigate before acting.",
                         0xEF233C,
                     )
-                log.info(f"[{game['name']}] Trend: ANOMALY_{direction} z={z:.1f}")
 
     # ── 7. Peak hour incoming ─────────────────────────────────────────────────
     best_h, best_avg = -1, -1
@@ -1043,7 +1074,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                         f"Signal: LONG before {best_h:02d}:00.",
                         0x90E0EF,
                     )
-                    log.info(f"[{game['name']}] Trend: PEAK_HOUR {best_h:02d}:00 (+{uplift:.0f}%)")
 
     # ── 8. Intraday momentum ──────────────────────────────────────────────────
     if len(ticks) >= 4:
@@ -1080,7 +1110,6 @@ def run_trend_analysis(game, data, ccu, dow, hour, now_est):
                             f"Signal: SHORT-TERM SHORT.",
                             0xEF233C,
                         )
-                    log.info(f"[{game['name']}] Trend: MOMENTUM_{direction} {total_move:+}")
 
 # ── Weekly summary ────────────────────────────────────────────────────────────
 
@@ -1095,6 +1124,18 @@ def send_weekly_summary(game, data):
     mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
     w = data.get("signal_weights", {})
 
+    # ── Simple weekly summary (main webhook) ─────────────────────────────────
+    simple_msg = (
+        f"**Last week at a glance:**\n"
+        f"📈 Peak players:  **{ws['high']:,}**\n"
+        f"📉 Lowest:        **{ws['low']:,}**\n"
+        f"📊 Average:       **{avg:,}**\n"
+    )
+    if mae:
+        simple_msg += f"\n🤖 Our forecasts were off by ~{mae:.0f} players on average."
+    send_discord_simple(game, f"📅 {game['name']} — Weekly Recap", simple_msg, {"signal": "HOLD"})
+
+    # ── Detailed weekly summary (detail webhook) ──────────────────────────────
     acc_str  = f"\nPred  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
     w_str    = (f"\nWeights  base {w.get('baseline',0):.2f}  "
                 f"slot {w.get('slot',0):.2f}  "
@@ -1114,43 +1155,41 @@ def send_weekly_summary(game, data):
         if h_mae and l_mae and h_mae >= l_mae * 0.9:
             cal_str += "\n⚠️ Conf tiers miscalibrated — thresholds may need tuning"
 
-    msg = (f"↑ {ws['high']:,}  ↓ {ws['low']:,}  avg {avg:,}"
-           f"{acc_str}{cal_str}{w_str}{bias_str}")
-    notify(game, f"📊 {game['name']} — Weekly Summary", msg, {"signal": "HOLD"})
+    detail_msg = (f"↑ {ws['high']:,}  ↓ {ws['low']:,}  avg {avg:,}"
+                  f"{acc_str}{cal_str}{w_str}{bias_str}")
+    notify_detail(game, f"📊 {game['name']} — Weekly Summary (Technical)", detail_msg, {"signal": "HOLD"})
     log.info(f"[{game['name']}] Weekly summary sent.")
 
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
 def send_daily_summary(game, data):
     state = get_state(game)
-    if state.intraday_ticks == 0: return
+    if state.intraday_ticks == 0:
+        return
     avg = state.intraday_sum // state.intraday_ticks
     low = state.intraday_low or 0
-    msg = f"↑ {state.intraday_high:,}  ↓ {low:,}  avg {avg:,}"
-    notify(game, f"📅 {game['name']} — Daily Summary", msg, {"signal": "HOLD"})
+
+    # ── Simple daily (main webhook) ───────────────────────────────────────────
+    simple_msg = (
+        f"📈 Peak today:  **{state.intraday_high:,}** players\n"
+        f"📉 Low today:   **{low:,}** players\n"
+        f"📊 Average:     **{avg:,}** players"
+    )
+    send_discord_simple(game, f"📅 {game['name']} — Daily Recap", simple_msg, {"signal": "HOLD"})
+
+    # ── Technical daily (detail webhook) ─────────────────────────────────────
+    notify_detail(game, f"📅 {game['name']} — Daily Summary",
+                  f"↑ {state.intraday_high:,}  ↓ {low:,}  avg {avg:,}", {"signal": "HOLD"})
     log.info(f"[{game['name']}] Daily — high={state.intraday_high:,} low={low:,} avg={avg:,}")
 
-# ── Main tick ─────────────────────────────────────────────────────────────────
-
-# ── Simulated price — multi-model, calibrated per game ────────────────────────
-#
-# Config keys (from elasticity_finder.lua Copy Config):
-#   sim_base_price   — avg price at avg CCU
-#   sim_elasticity   — CCU elasticity (from finder)
-#   sim_best_model   — "holt" | "rev" | "mom" | "ens" | "ccu"  (best model found by finder)
-#   sim_rev_alpha    — mean-reversion speed  (if best_model is "rev" or "ens")
-#   sim_holt_alpha   — Holt level smoothing  (if best_model is "holt" or "ens", default 0.3)
-#   sim_holt_beta    — Holt trend smoothing  (if best_model is "holt" or "ens", default 0.1)
-#
-# Model state is persisted in Redis under data["price_model_state"] and self-advances
-# every tick. Recalibrate by re-running elasticity_finder.lua and pasting fresh values.
+# ── Simulated price ───────────────────────────────────────────────────────────
 
 def _ccu_factor(game, data, ccu):
     elasticity = game.get("sim_elasticity", 0.0)
     if elasticity == 0.0:
         return 1.0
-    slots = data.get("slots", {})
-    avgs  = [s["avg"] for s in slots.values() if s.get("n", 0) >= 3 and s.get("avg", 0) > 0]
+    slots   = data.get("slots", {})
+    avgs    = [s["avg"] for s in slots.values() if s.get("n", 0) >= 3 and s.get("avg", 0) > 0]
     avg_ccu = sum(avgs) / len(avgs) if avgs else None
     if avg_ccu and avg_ccu > 0:
         return (ccu / avg_ccu) ** elasticity
@@ -1159,13 +1198,12 @@ def _ccu_factor(game, data, ccu):
 def calc_sim_price(game, data, ccu):
     base = game.get("sim_base_price")
     if base is None:
-        return None, None
+        return None, None, None, None
 
-    model     = game.get("sim_best_model", "holt")
-    obs       = base * _ccu_factor(game, data, ccu)
-    ms        = data.setdefault("price_model_state", {})
+    model = game.get("sim_best_model", "holt")
+    obs   = base * _ccu_factor(game, data, ccu)
+    ms    = data.setdefault("price_model_state", {})
 
-    # ── Holt (level + trend) ──────────────────────────────────────────────────
     def _holt_step(obs_val):
         alpha = game.get("sim_holt_alpha", 0.3)
         beta  = game.get("sim_holt_beta",  0.1)
@@ -1177,10 +1215,9 @@ def calc_sim_price(game, data, ccu):
         ms["holt_trend"] = t_new
         return l_new + t_new
 
-    # ── Mean reversion (EMA + reversion) ─────────────────────────────────────
     def _rev_step(obs_val):
-        ema_alpha = game.get("sim_ema_alpha",  0.15)
-        rev_alpha = game.get("sim_rev_alpha",  0.2)
+        ema_alpha = game.get("sim_ema_alpha", 0.15)
+        rev_alpha = game.get("sim_rev_alpha", 0.2)
         ema       = ms.get("rev_ema",  base)
         last      = ms.get("rev_last", base)
         ema_new   = ema_alpha * obs_val + (1 - ema_alpha) * ema
@@ -1189,7 +1226,6 @@ def calc_sim_price(game, data, ccu):
         ms["rev_last"] = obs_val
         return pred
 
-    # ── Price momentum (weighted recent deltas) ───────────────────────────────
     def _mom_step(obs_val):
         history = ms.get("mom_history", [base])
         history.append(obs_val)
@@ -1197,13 +1233,12 @@ def calc_sim_price(game, data, ccu):
         ms["mom_history"] = history
         if len(history) < 2:
             return obs_val
-        deltas = [history[i+1] - history[i] for i in range(len(history)-1)]
+        deltas  = [history[i+1] - history[i] for i in range(len(history)-1)]
         weights = [0.6 ** (len(deltas) - 1 - i) for i in range(len(deltas))]
         w_sum   = sum(weights)
         delta   = sum(d * w for d, w in zip(deltas, weights)) / w_sum
         return history[-1] + delta
 
-    # ── Dispatch ──────────────────────────────────────────────────────────────
     if model == "rev":
         predicted = _rev_step(obs)
     elif model == "mom":
@@ -1213,16 +1248,13 @@ def calc_sim_price(game, data, ccu):
         pr = _rev_step(obs)
         pm = _mom_step(obs)
         predicted = (ph + pr + pm) / 3
-    else:  # "holt" or "ccu" (ccu falls back to holt with ccu_factor baked in)
+    else:
         predicted = _holt_step(obs)
 
     data["price_model_state"] = ms
-    predicted = round(predicted, 2)
-
-    # Price uncertainty from calibration
-    price_std = game.get("sim_price_std", None)
-    ci95      = game.get("sim_ci95",      None)
-
+    predicted   = round(predicted, 2)
+    price_std   = game.get("sim_price_std", None)
+    ci95        = game.get("sim_ci95",      None)
     pct_vs_base = (predicted - base) / base * 100
     sign        = "+" if pct_vs_base >= 0 else ""
     ci_str      = f"  ±{ci95:.2f}" if ci95 else ""
@@ -1230,7 +1262,7 @@ def calc_sim_price(game, data, ccu):
 
     return predicted, sim_str, price_std, ci95
 
-
+# ── Main tick ─────────────────────────────────────────────────────────────────
 
 def run_tick(game):
     now_est = datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_OFFSET)
@@ -1251,10 +1283,11 @@ def run_tick(game):
         state.last_date      = today
 
     ccu = fetch_ccu(game)
-    if ccu is None: return
+    if ccu is None:
+        return
 
     data   = load_data(game)
-    autoseed_from_ticks(game, data)   # no-op if slots already populated
+    autoseed_from_ticks(game, data)
     scored = score_last_prediction(data, ccu, dow, now_est.hour)
 
     avg_hour, ath, is_new_ath = record_snapshot(data, game, dow, now_est.hour, ccu, now_est)
@@ -1276,6 +1309,7 @@ def run_tick(game):
     cv_val       = sig.get("cv")
     streak_input = sig["signal"] if sig.get("confidence") in ("High", "Medium") else "HOLD"
     streak_sig, streak_count = update_streak(data, streak_input)
+
     log.info(f"[{game['name']}] Signal: {sig['signal']} ({sig['confidence']}) "
              + (f"cv={cv_val:.1f}% — " if cv_val else "— ")
              + sig["reasoning"]
@@ -1289,31 +1323,8 @@ def run_tick(game):
         sign     = "+" if pred["delta"] >= 0 else ""
         pred_str = (f"{pred['predicted_ccu']:,} ({sign}{pred['delta']:,} / "
                     f"{sign}{pred['delta_pct']:.1f}%)  {pred['confidence']}")
-        log.info(f"[{game['name']}] Next tick: {pred_str}  [{pred['detail']}]")
     else:
         pred_str = "—"
-
-    # Stop loss / take profit — price-based, using calibrated sim price uncertainty
-    sl_tp_lines = ""
-    if (sig["signal"] in ("LONG", "SHORT")
-            and _sim_price is not None
-            and sim_price_std is not None):
-
-        # Use CI95 as primary uncertainty; fall back to 1σ
-        half_range = sim_ci95 if sim_ci95 else sim_price_std
-
-        if sig["signal"] == "LONG":
-            tp_price = round(_sim_price + 1.0 * half_range, 2)
-            sl_price = round(_sim_price - 1.5 * half_range, 2)
-            sl_price = max(sl_price, 0.01)
-            if tp_price > _sim_price:
-                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
-        else:  # SHORT
-            tp_price = round(_sim_price - 1.0 * half_range, 2)
-            sl_price = round(_sim_price + 1.5 * half_range, 2)
-            tp_price = max(tp_price, 0.01)
-            if tp_price < _sim_price:
-                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
 
     mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
     acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
@@ -1325,17 +1336,14 @@ def run_tick(game):
 
     event_label = detect_event(data, ccu, dow, now_est.hour, pct_15m)
     ttp_str     = time_to_peak(data, now_est)
-    peak_str    = ttp_str if ttp_str else ""
 
     check_slot_drift(game, data, dow, now_est.hour, today)
     check_reseed_reminder(game, data)
-
-    # ── Trend analysis — runs after snapshot, before save ─────────────────────
     run_trend_analysis(game, data, ccu, dow, now_est.hour, now_est)
 
-    # ── Simulated price ───────────────────────────────────────────────────────
     _sim_price, sim_price_str, sim_price_std, sim_ci95 = calc_sim_price(game, data, ccu)
 
+    # ── Titles ────────────────────────────────────────────────────────────────
     if is_new_ath:
         prev_ath  = game["ath_floor"]
         pct_above = (ccu - prev_ath) / prev_ath * 100 if prev_ath else 0
@@ -1351,18 +1359,63 @@ def run_tick(game):
     else:
         title = f"{game['name']} • {DAYS[dow]} {now_est.strftime('%-I:%M %p')}  {ccu:,}"
 
-    if event_label:                      trend = event_label
-    elif pct_avg >  config.BREAKOUT_PCT: trend = "🔥 BREAKOUT"
-    elif pct_avg < -config.DROP_AVG_PCT: trend = "📉 BELOW AVG"
-    else:                                trend = "⚖️ Stable"
+    if event_label:
+        trend_label = event_label
+    elif pct_avg > config.BREAKOUT_PCT:
+        trend_label = "🔥 BREAKOUT"
+    elif pct_avg < -config.DROP_AVG_PCT:
+        trend_label = "📉 BELOW AVG"
+    else:
+        trend_label = "⚖️ Stable"
 
     time_label  = now_est.strftime("%-I:%M %p")
     low_display = f"{state.intraday_low:,}" if state.intraday_low is not None else "—"
-    pct_str     = f"{(ccu-sig['curr_avg'])/sig['curr_avg']*100:+.1f}%" if sig["curr_avg"] else ""
-    cv_str      = f"  cv {cv_val:.0f}%" if cv_val is not None else ""
 
-    bias_val  = data.get("bias", 0.0)
-    bias_pct  = abs(bias_val) / max(ccu, 1) * 100
+    # =========================================================================
+    # SIMPLE MESSAGE — friendly, minimal jargon, easy to read for new players
+    # =========================================================================
+    friendly_headline, friendly_desc = FRIENDLY_SIGNAL.get(
+        sig["signal"], ("⚪ Update", "Player count checked.")
+    )
+
+    # Player count change since last check
+    change_str = ""
+    if state.last_tick is not None:
+        diff = ccu - state.last_tick
+        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "—")
+        change_str = f"{arrow} {abs(diff):,} since last check"
+
+    # Friendly peak time line
+    peak_friendly = ""
+    if ttp_str:
+        peak_friendly = f"\n⏰ {ttp_str}"
+
+    # ATH callout
+    ath_friendly = ""
+    if is_new_ath:
+        ath_friendly = f"\n🏆 **New all-time record!** {ccu:,} players"
+
+    simple_message = (
+        f"**{ccu:,} players online**"
+        + (f"  •  {change_str}" if change_str else "")
+        + f"\n\n"
+        f"{friendly_headline}\n"
+        f"*{friendly_desc}*"
+        + (f"\n\n📊 Today's range:  {state.intraday_low or ccu:,} – {state.intraday_high:,}" if state.intraday_ticks > 1 else "")
+        + peak_friendly
+        + ath_friendly
+    )
+
+    send_discord_simple(game, title, simple_message, sig)
+
+    # =========================================================================
+    # DETAILED MESSAGE — full technical data for the detail webhook
+    # =========================================================================
+    pct_str  = f"{(ccu - sig['curr_avg']) / sig['curr_avg'] * 100:+.1f}%" if sig["curr_avg"] else ""
+    cv_str   = f"  cv {cv_val:.0f}%" if cv_val is not None else ""
+
+    bias_val = data.get("bias", 0.0)
+    bias_pct = abs(bias_val) / max(ccu, 1) * 100
     if bias_pct > 20:
         bias_note = f"  ⚠️ bias {-bias_val:+.0f} (model converging)"
     elif abs(bias_val) > 15:
@@ -1374,8 +1427,25 @@ def run_tick(game):
     sig_line1  = f"{sig_emoji} {sig['signal']}{streak_str}  •  {sig['confidence']}{cv_str}"
     sig_line2  = f"CCU {pct_str} vs adj. avg  •  1h: {forecast_str}"
 
-    message = (
-        f"{trend}  •  {DAYS[dow]} {time_label}\n"
+    # Stop loss / take profit
+    sl_tp_lines = ""
+    if (sig["signal"] in ("LONG", "SHORT")
+            and _sim_price is not None
+            and sim_price_std is not None):
+        half_range = sim_ci95 if sim_ci95 else sim_price_std
+        if sig["signal"] == "LONG":
+            tp_price = round(_sim_price + 1.0 * half_range, 2)
+            sl_price = max(round(_sim_price - 1.5 * half_range, 2), 0.01)
+            if tp_price > _sim_price:
+                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
+        else:
+            tp_price = max(round(_sim_price - 1.0 * half_range, 2), 0.01)
+            sl_price = round(_sim_price + 1.5 * half_range, 2)
+            if tp_price < _sim_price:
+                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
+
+    detail_message = (
+        f"{trend_label}  •  {DAYS[dow]} {time_label}\n"
         f"\n"
         f"CCU      {ccu:,}\n"
         f"15m      {d_15m}\n"
@@ -1389,14 +1459,14 @@ def run_tick(game):
         f"{sig_line2}\n"
         f"Next tick  {pred_str}{bias_note}"
         f"{sl_tp_lines}"
-        + (f"\n{peak_str}" if peak_str else "")
+        + (f"\n{ttp_str}" if ttp_str else "")
         + acc_str
     )
 
+    send_discord_detail(game, title, detail_message, sig)
+
     persist_state(game, data, now_est)
     save_data(game, data)
-
-    notify(game, title, message, sig)
     state.last_tick = ccu
     log.info(f"[{game['name']}] Tick @ {time_label} — "
              f"CCU: {ccu:,} | Avg: {round(avg_hour):,} | ATH: {ath:,} | "
@@ -1420,7 +1490,8 @@ if __name__ == "__main__":
         log.info(f"Tracking: {game['name']}  (universe {game['universe_id']})")
 
     log.info(f"Redis: {REDIS_URL[:40]}...")
-    log.info(f"Discord: {'enabled' if config.DISCORD_WEBHOOK else 'disabled'}")
+    log.info(f"Discord (simple):  {'enabled' if config.DISCORD_WEBHOOK else 'disabled'}")
+    log.info(f"Discord (detail):  {'enabled' if DISCORD_WEBHOOK_DETAIL else 'disabled'}")
     log.info(f"Games: {len(config.GAMES)}  |  Spacer between embeds: enabled")
 
     while not _shutdown:

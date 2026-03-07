@@ -16,6 +16,8 @@ Additions:
   5. Per-slot drift detection — alerts when slot averages lag actuals by >20%
   6. Confidence calibration report in weekly summary
   7. Discord spacer — zero-width space message between each game's embed
+  8. Trend engine — structural pattern detection per game (DOW cycle, decay,
+     macro trend, anomalies, intraday momentum, peak-hour countdown)
 
 Requires: pip install requests
 """
@@ -26,6 +28,7 @@ from urllib.parse import quote
 
 import requests
 import config
+from trend_engine import run_trend_analysis
 
 logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -95,6 +98,7 @@ def load_data(game):
             data.setdefault("seed_ts",        None)
             data.setdefault("signal_streak",  {"signal": None, "count": 0})
             data.setdefault("drift_warned",   {})
+            data.setdefault("trend_state",    {})   # trend engine cooldown state
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -105,7 +109,7 @@ def load_data(game):
         "signal_weights": {"baseline": 1.5, "slot": 1.2, "momentum": 0.6},
         "bias": 0.0, "slot_errors": {},
         "seed_ts": None, "signal_streak": {"signal": None, "count": 0},
-        "drift_warned": {},
+        "drift_warned": {}, "trend_state": {},
     }
 
 def save_data(game, data):
@@ -265,12 +269,23 @@ def slot_confidence(data, dh_key, cv):
 def check_slot_drift(game, data, dow, hour, now_date):
     """
     Compares stored slot avg against recent actual ticks for the same dow+hour.
-    Fires a Discord alert at most once per 7 days per slot.
+    Only considers ticks recorded after the last reseed (seed_ts) to avoid
+    false positives immediately after a reseed.
+    Fires at most once per 14 days per slot; cooldown resets on reseed.
     """
     dh_key = f"{dow}_{hour}"
     slot   = data["slots"].get(dh_key)
     if not slot or slot["n"] < config.SIGNAL_MIN_SAMPLES:
         return
+
+    # Parse seed timestamp for post-seed filtering
+    seed_ts = data.get("seed_ts")
+    seed_dt = None
+    if seed_ts:
+        try:
+            seed_dt = datetime.fromisoformat(seed_ts)
+        except (ValueError, TypeError):
+            pass
 
     ticks          = data.get("ticks", [])
     recent_actuals = []
@@ -278,6 +293,9 @@ def check_slot_drift(game, data, dow, hour, now_date):
         try:
             t_dt = datetime.strptime(t["ts"], "%Y-%m-%dT%H:%M")
         except ValueError:
+            continue
+        # Only consider ticks recorded after the last reseed
+        if seed_dt and t_dt <= seed_dt:
             continue
         if t_dt.weekday() == dow and t_dt.hour == hour:
             recent_actuals.append(t["ccu"])
@@ -294,10 +312,16 @@ def check_slot_drift(game, data, dow, hour, now_date):
 
     warned = data.setdefault("drift_warned", {})
     last_w = warned.get(dh_key)
+
+    # Cooldown key encodes seed_ts so a reseed always resets it
+    seed_tag   = seed_ts or "noseed"
+    warned_key = f"{dh_key}|{seed_tag}"
+    last_w     = warned.get(warned_key)
+
     if last_w:
         try:
             days_since = (now_date - datetime.fromisoformat(last_w).date()).days
-            if days_since < 7:
+            if days_since < 14:
                 return
         except (ValueError, TypeError):
             pass
@@ -317,7 +341,7 @@ def check_slot_drift(game, data, dow, hour, now_date):
         + f"Consider reseeding: `python3 seed_redis.py`"
     )
     notify(game, f"📊 {game['name']} — Slot Drift: {slot_label}", msg, {"signal": "HOLD"})
-    warned[dh_key]       = now_date.isoformat()
+    warned[warned_key]   = now_date.isoformat()
     data["drift_warned"] = warned
     log.warning(f"[{game['name']}] Drift: {slot_label} avg={slot['avg']:.0f} "
                 f"recent={recent_avg:.0f} drift={drift_pct:+.1f}%")
@@ -691,7 +715,8 @@ def send_discord(game, title, message, sig, retries=3):
     webhook = config.DISCORD_WEBHOOK
     if not webhook:
         return
-    color   = SIGNAL_COLORS.get(sig["signal"], 0x888888)
+    color_override = sig.get("color_override")
+    color   = color_override if color_override else SIGNAL_COLORS.get(sig["signal"], 0x888888)
     payload = json.dumps({"embeds": [{"title": title, "description": message,
                                       "color": color,
                                       "footer": {"text": f"{game['name']}  •  EST"}}]})
@@ -892,6 +917,11 @@ def run_tick(game):
 
     check_slot_drift(game, data, dow, now_est.hour, today)
     check_reseed_reminder(game, data)
+
+    # ── Trend engine ──────────────────────────────────────────────────────────
+    # Runs after slot data is recorded. Fires its own Discord alerts independently.
+    # Mutates data["trend_state"] for cooldown tracking — saved below.
+    run_trend_analysis(game, data, ccu, now_est, send_fn=notify)
 
     if is_new_ath:
         prev_ath  = game["ath_floor"]

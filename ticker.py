@@ -1395,6 +1395,15 @@ def run_tick(game):
     if is_new_ath:
         ath_friendly = f"\n🏆 **New all-time record!** {ccu:,} players"
 
+    sim_friendly = ""
+    if _sim_price is not None:
+        base = game.get("sim_base_price")
+        ci95 = game.get("sim_ci95")
+        pct_vs_base = (_sim_price - base) / base * 100 if base else 0
+        sign = "+" if pct_vs_base >= 0 else ""
+        ci_str = f" ±{ci95:.2f}" if ci95 else ""
+        sim_friendly = f"\n💰 Sim price:  **${_sim_price:.2f}{ci_str}** ({sign}{pct_vs_base:.1f}% vs avg)"
+
     simple_message = (
         f"**{ccu:,} players online**"
         + (f"  •  {change_str}" if change_str else "")
@@ -1402,6 +1411,7 @@ def run_tick(game):
         f"{friendly_headline}\n"
         f"*{friendly_desc}*"
         + (f"\n\n📊 Today's range:  {state.intraday_low or ccu:,} – {state.intraday_high:,}" if state.intraday_ticks > 1 else "")
+        + sim_friendly
         + peak_friendly
         + ath_friendly
     )

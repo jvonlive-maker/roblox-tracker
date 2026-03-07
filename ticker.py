@@ -1179,14 +1179,14 @@ def calc_sim_price(game, data, ccu):
 
     # ── Mean reversion (EMA + reversion) ─────────────────────────────────────
     def _rev_step(obs_val):
-        alpha_ema = 0.15
-        rev_alpha = game.get("sim_rev_alpha", 0.2)
-        ema       = ms.get("rev_ema", base)
+        ema_alpha = game.get("sim_ema_alpha",  0.15)
+        rev_alpha = game.get("sim_rev_alpha",  0.2)
+        ema       = ms.get("rev_ema",  base)
         last      = ms.get("rev_last", base)
-        ema_new   = alpha_ema * obs_val + (1 - alpha_ema) * ema
+        ema_new   = ema_alpha * obs_val + (1 - ema_alpha) * ema
         pred      = last + rev_alpha * (ema_new - last)
         ms["rev_ema"]  = ema_new
-        ms["rev_last"] = obs_val  # update with actual obs for next step
+        ms["rev_last"] = obs_val
         return pred
 
     # ── Price momentum (weighted recent deltas) ───────────────────────────────
@@ -1219,11 +1219,16 @@ def calc_sim_price(game, data, ccu):
     data["price_model_state"] = ms
     predicted = round(predicted, 2)
 
+    # Price uncertainty from calibration
+    price_std = game.get("sim_price_std", None)
+    ci95      = game.get("sim_ci95",      None)
+
     pct_vs_base = (predicted - base) / base * 100
     sign        = "+" if pct_vs_base >= 0 else ""
-    sim_str     = f"~{predicted:.2f}  ({sign}{pct_vs_base:.1f}% vs base {base:.2f})  *(approx)*"
+    ci_str      = f"  ±{ci95:.2f}" if ci95 else ""
+    sim_str     = f"~{predicted:.2f}{ci_str}  ({sign}{pct_vs_base:.1f}% vs base {base:.2f})  *(approx)*"
 
-    return predicted, sim_str
+    return predicted, sim_str, price_std, ci95
 
 
 
@@ -1288,43 +1293,27 @@ def run_tick(game):
     else:
         pred_str = "—"
 
-    # Stop loss / take profit — only on actionable LONG or SHORT signals
+    # Stop loss / take profit — price-based, using calibrated sim price uncertainty
     sl_tp_lines = ""
-    dh_key = f"{dow}_{now_est.hour}"
-    se     = data["slot_errors"].get(dh_key)
-    use_sl_tp = (
-        sig["signal"] in ("LONG", "SHORT")
-        and pred["confidence"] == "High"
-        and pred["predicted_ccu"] is not None
-        and pred["std"] is not None
-        and cv_val is not None and cv_val < 20
-        and (
-            (se and se["n"] >= 5 and se["mae"] / max(ccu, 1) * 100 < 8)
-            or cv_val < 12
-        )
-    )
-    if use_sl_tp:
-        std = pred["std"]
+    if (sig["signal"] in ("LONG", "SHORT")
+            and _sim_price is not None
+            and sim_price_std is not None):
+
+        # Use CI95 as primary uncertainty; fall back to 1σ
+        half_range = sim_ci95 if sim_ci95 else sim_price_std
+
         if sig["signal"] == "LONG":
-            # Entered long at ccu — expect price to rise
-            # TP above predicted, SL below predicted
-            tp = round(pred["predicted_ccu"] + 1.0 * std)
-            sl = round(pred["predicted_ccu"] - 1.5 * std)
-            sl = max(sl, 0)
-            if sl == 0 or tp <= ccu:
-                sl_tp_lines = ""
-            else:
-                sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
+            tp_price = round(_sim_price + 1.0 * half_range, 2)
+            sl_price = round(_sim_price - 1.5 * half_range, 2)
+            sl_price = max(sl_price, 0.01)
+            if tp_price > _sim_price:
+                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
         else:  # SHORT
-            # Entered short at ccu — expect price to fall
-            # TP below predicted, SL above predicted
-            tp = round(pred["predicted_ccu"] - 1.0 * std)
-            sl = round(pred["predicted_ccu"] + 1.5 * std)
-            tp = max(tp, 0)
-            if tp >= ccu:
-                sl_tp_lines = ""
-            else:
-                sl_tp_lines = f"\n🎯 TP  {tp:,}   🛑 SL  {sl:,}"
+            tp_price = round(_sim_price - 1.0 * half_range, 2)
+            sl_price = round(_sim_price + 1.5 * half_range, 2)
+            tp_price = max(tp_price, 0.01)
+            if tp_price < _sim_price:
+                sl_tp_lines = f"\n🎯 TP  ${tp_price:.2f}   🛑 SL  ${sl_price:.2f}   (sim ±{half_range:.2f})"
 
     mae, dir_pct, calibration, n_pred = prediction_accuracy(data)
     acc_str = f"\nModel  MAE {mae:.0f}  dir {dir_pct:.0f}%  n={n_pred}" if mae else ""
@@ -1345,7 +1334,7 @@ def run_tick(game):
     run_trend_analysis(game, data, ccu, dow, now_est.hour, now_est)
 
     # ── Simulated price ───────────────────────────────────────────────────────
-    _sim_price, sim_price_str = calc_sim_price(game, data, ccu)
+    _sim_price, sim_price_str, sim_price_std, sim_ci95 = calc_sim_price(game, data, ccu)
 
     if is_new_ath:
         prev_ath  = game["ath_floor"]

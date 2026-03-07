@@ -97,9 +97,9 @@ def load_data(game):
             data.setdefault("slot_errors",    {})
             data.setdefault("seed_ts",        None)
             data.setdefault("signal_streak",  {"signal": None, "count": 0})
-            data.setdefault("drift_warned",   {})
-            data.setdefault("trend_state",    {})
-            data.setdefault("holt_state",     {})
+            data.setdefault("drift_warned",       {})
+            data.setdefault("trend_state",        {})
+            data.setdefault("price_model_state",  {})
             return data
     except Exception as e:
         log.warning(f"[{game['name']}] Redis load failed: {e} — starting fresh.")
@@ -1132,67 +1132,99 @@ def send_daily_summary(game, data):
 
 # ── Main tick ─────────────────────────────────────────────────────────────────
 
-# ── Simulated price (Holt exponential smoothing, calibrated per game) ─────────
+# ── Simulated price — multi-model, calibrated per game ────────────────────────
 #
-# Each game can carry these optional config keys (from elasticity_finder.lua):
-#   sim_base_price   — average price at average CCU (from finder)
-#   sim_elasticity   — CCU elasticity coefficient   (from finder, often ~0 for FF2)
-#   sim_holt_alpha   — Holt level smoothing (default 0.3)
-#   sim_holt_beta    — Holt trend smoothing (default 0.1)
+# Config keys (from elasticity_finder.lua Copy Config):
+#   sim_base_price   — avg price at avg CCU
+#   sim_elasticity   — CCU elasticity (from finder)
+#   sim_best_model   — "holt" | "rev" | "mom" | "ens" | "ccu"  (best model found by finder)
+#   sim_rev_alpha    — mean-reversion speed  (if best_model is "rev" or "ens")
+#   sim_holt_alpha   — Holt level smoothing  (if best_model is "holt" or "ens", default 0.3)
+#   sim_holt_beta    — Holt trend smoothing  (if best_model is "holt" or "ens", default 0.1)
 #
-# Holt state (level + trend) is persisted in Redis under data["holt_state"]
-# and auto-advances each tick — no login required between calibrations.
-# Recalibrate by re-running elasticity_finder.lua and pasting fresh values.
+# Model state is persisted in Redis under data["price_model_state"] and self-advances
+# every tick. Recalibrate by re-running elasticity_finder.lua and pasting fresh values.
+
+def _ccu_factor(game, data, ccu):
+    elasticity = game.get("sim_elasticity", 0.0)
+    if elasticity == 0.0:
+        return 1.0
+    slots = data.get("slots", {})
+    avgs  = [s["avg"] for s in slots.values() if s.get("n", 0) >= 3 and s.get("avg", 0) > 0]
+    avg_ccu = sum(avgs) / len(avgs) if avgs else None
+    if avg_ccu and avg_ccu > 0:
+        return (ccu / avg_ccu) ** elasticity
+    return 1.0
 
 def calc_sim_price(game, data, ccu):
-    base  = game.get("sim_base_price")
+    base = game.get("sim_base_price")
     if base is None:
-        return None, None  # game not configured
+        return None, None
 
-    elasticity = game.get("sim_elasticity", 0.0)
-    alpha      = game.get("sim_holt_alpha",  0.3)
-    beta       = game.get("sim_holt_beta",   0.1)
+    model     = game.get("sim_best_model", "holt")
+    obs       = base * _ccu_factor(game, data, ccu)
+    ms        = data.setdefault("price_model_state", {})
 
-    # CCU adjustment factor
-    avg_ccu = None
-    slots   = data.get("slots", {})
-    if slots:
-        avgs = [s["avg"] for s in slots.values() if s.get("n", 0) >= 3 and s.get("avg", 0) > 0]
-        if avgs:
-            avg_ccu = sum(avgs) / len(avgs)
-    if avg_ccu and avg_ccu > 0 and elasticity != 0:
-        ccu_factor = (ccu / avg_ccu) ** elasticity
-    else:
-        ccu_factor = 1.0
+    # ── Holt (level + trend) ──────────────────────────────────────────────────
+    def _holt_step(obs_val):
+        alpha = game.get("sim_holt_alpha", 0.3)
+        beta  = game.get("sim_holt_beta",  0.1)
+        level = ms.get("holt_level", base)
+        trend = ms.get("holt_trend", 0.0)
+        l_new = alpha * obs_val + (1 - alpha) * (level + trend)
+        t_new = beta  * (l_new - level) + (1 - beta) * trend
+        ms["holt_level"] = l_new
+        ms["holt_trend"] = t_new
+        return l_new + t_new
 
-    # Holt level + trend — persisted in Redis
-    hs    = data.setdefault("holt_state", {})
-    level = hs.get("level")
-    trend = hs.get("trend", 0.0)
+    # ── Mean reversion (EMA + reversion) ─────────────────────────────────────
+    def _rev_step(obs_val):
+        alpha_ema = 0.15
+        rev_alpha = game.get("sim_rev_alpha", 0.2)
+        ema       = ms.get("rev_ema", base)
+        last      = ms.get("rev_last", base)
+        ema_new   = alpha_ema * obs_val + (1 - alpha_ema) * ema
+        pred      = last + rev_alpha * (ema_new - last)
+        ms["rev_ema"]  = ema_new
+        ms["rev_last"] = obs_val  # update with actual obs for next step
+        return pred
 
-    # Bootstrap: first time, seed level from base price
-    if level is None:
-        level = base
-        trend = 0.0
+    # ── Price momentum (weighted recent deltas) ───────────────────────────────
+    def _mom_step(obs_val):
+        history = ms.get("mom_history", [base])
+        history.append(obs_val)
+        history = history[-5:]
+        ms["mom_history"] = history
+        if len(history) < 2:
+            return obs_val
+        deltas = [history[i+1] - history[i] for i in range(len(history)-1)]
+        weights = [0.6 ** (len(deltas) - 1 - i) for i in range(len(deltas))]
+        w_sum   = sum(weights)
+        delta   = sum(d * w for d, w in zip(deltas, weights)) / w_sum
+        return history[-1] + delta
 
-    # Holt update: new observation is base * ccu_factor (CCU-adjusted base)
-    obs    = base * ccu_factor
-    l_new  = alpha * obs + (1 - alpha) * (level + trend)
-    t_new  = beta  * (l_new - level) + (1 - beta) * trend
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+    if model == "rev":
+        predicted = _rev_step(obs)
+    elif model == "mom":
+        predicted = _mom_step(obs)
+    elif model == "ens":
+        ph = _holt_step(obs)
+        pr = _rev_step(obs)
+        pm = _mom_step(obs)
+        predicted = (ph + pr + pm) / 3
+    else:  # "holt" or "ccu" (ccu falls back to holt with ccu_factor baked in)
+        predicted = _holt_step(obs)
 
-    hs["level"] = l_new
-    hs["trend"] = t_new
-    data["holt_state"] = hs
+    data["price_model_state"] = ms
+    predicted = round(predicted, 2)
 
-    # Predicted price = level + one step of trend
-    predicted = round(l_new + t_new, 2)
-
-    # % vs base
     pct_vs_base = (predicted - base) / base * 100
-    sign = "+" if pct_vs_base >= 0 else ""
-    sim_str = f"~{predicted:.2f}  ({sign}{pct_vs_base:.1f}% vs base {base:.2f})  *(approx)*"
+    sign        = "+" if pct_vs_base >= 0 else ""
+    sim_str     = f"~{predicted:.2f}  ({sign}{pct_vs_base:.1f}% vs base {base:.2f})  *(approx)*"
 
     return predicted, sim_str
+
 
 
 def run_tick(game):
